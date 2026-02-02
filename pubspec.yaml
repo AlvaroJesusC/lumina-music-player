@@ -1,0 +1,29 @@
+name: lumina_player
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.8
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  
+  # Audio player dependencies
+  permission_handler: ^11.3.1
+  on_audio_query: ^2.9.0
+  just_audio: ^0.9.36
+  audio_video_progress_bar: ^2.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
