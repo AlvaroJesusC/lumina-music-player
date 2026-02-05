@@ -2,12 +2,138 @@ import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:audio_video_progress_bar/audio_video_progress_bar.dart';
+import 'package:rxdart/rxdart.dart';
 import 'dart:math';
 import 'dart:ui';
 
-void main() {
+late AudioHandler _audioHandler;
+
+Future<void> main() async {
+  // 1. Inicialización mínima obligatoria
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 2. Inicializar AudioService ANTES de runApp
+  _audioHandler = await AudioService.init(
+    builder: () => MyAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.example.lumina_player.channel.audio',
+      androidNotificationChannelName: 'Lumina Player',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+    ),
+  );
+
   runApp(const LuminaApp());
+}
+
+class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  final _player = AudioPlayer();
+  final _playlist = ConcatenatingAudioSource(children: []);
+
+  MyAudioHandler() {
+    _initPlayer();
+  }
+
+  Future<void> _initPlayer() async {
+    try {
+      await _player.setAudioSource(_playlist);
+      _notifyAudioHandlerAboutPlaybackEvents();
+      _listenForCurrentSongIndexChanges();
+      _listenForSequenceStateChanges();
+    } catch (e) {
+      debugPrint("Error inicializando player: $e");
+    }
+  }
+
+  void _notifyAudioHandlerAboutPlaybackEvents() {
+    _player.playbackEventStream.listen((PlaybackEvent event) {
+      final playing = _player.playing;
+      playbackState.add(playbackState.value.copyWith(
+        controls: [
+          MediaControl.skipToPrevious,
+          if (playing) MediaControl.pause else MediaControl.play,
+          MediaControl.skipToNext,
+        ],
+        systemActions: const {
+          MediaAction.seek,
+          MediaAction.seekForward,
+          MediaAction.seekBackward,
+          MediaAction.setShuffleMode,
+        },
+        androidCompactActionIndices: const [0, 1, 2],
+        processingState: const {
+          ProcessingState.idle: AudioProcessingState.idle,
+          ProcessingState.loading: AudioProcessingState.loading,
+          ProcessingState.buffering: AudioProcessingState.buffering,
+          ProcessingState.ready: AudioProcessingState.ready,
+          ProcessingState.completed: AudioProcessingState.completed,
+        }[_player.processingState]!,
+        playing: playing,
+        updatePosition: _player.position,
+        bufferedPosition: _player.bufferedPosition,
+        speed: _player.speed,
+        queueIndex: event.currentIndex,
+        shuffleMode: (_player.shuffleModeEnabled) ? AudioServiceShuffleMode.all : AudioServiceShuffleMode.none,
+      ));
+    });
+  }
+
+  void _listenForCurrentSongIndexChanges() {
+    _player.currentIndexStream.listen((index) {
+      final playlist = queue.value;
+      if (index == null || playlist.isEmpty || index >= playlist.length) return;
+      mediaItem.add(playlist[index]);
+    });
+  }
+
+  void _listenForSequenceStateChanges() {
+    _player.sequenceStateStream.listen((SequenceState? sequenceState) {
+      final sequence = sequenceState?.effectiveSequence;
+      if (sequence == null || sequence.isEmpty) return;
+      final items = sequence.map((source) => source.tag as MediaItem);
+      queue.add(items.toList());
+    });
+  }
+
+  @override
+  Future<void> addQueueItems(List<MediaItem> mediaItems) async {
+    final audioSources = mediaItems.map((item) => AudioSource.uri(
+      Uri.parse(item.extras!['url']),
+      tag: item,
+    ));
+    await _playlist.clear();
+    await _playlist.addAll(audioSources.toList());
+    queue.add(mediaItems);
+  }
+
+  @override
+  Future<void> play() => _player.play();
+  @override
+  Future<void> pause() => _player.pause();
+  @override
+  Future<void> seek(Duration position) => _player.seek(position);
+  @override
+  Future<void> skipToNext() => _player.seekToNext();
+  @override
+  Future<void> skipToPrevious() => _player.seekToPrevious();
+  @override
+  Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
+    final enabled = shuffleMode != AudioServiceShuffleMode.none;
+    if (enabled) await _player.shuffle();
+    await _player.setShuffleModeEnabled(enabled);
+  }
+  @override
+  Future<void> skipToQueueItem(int index) async {
+    if (index < 0 || index >= queue.value.length) return;
+    _player.seek(Duration.zero, index: index);
+  }
+  @override
+  Future<void> stop() async {
+    await _player.stop();
+    return super.stop();
+  }
 }
 
 class PlaylistModelCustom {
@@ -20,24 +146,17 @@ class PlaylistModelCustom {
 
 class LuminaApp extends StatefulWidget {
   const LuminaApp({super.key});
-
   @override
   State<LuminaApp> createState() => _LuminaAppState();
 }
 
 class _LuminaAppState extends State<LuminaApp> {
   ThemeMode _themeMode = ThemeMode.dark;
-
-  void _toggleTheme(bool isDark) {
-    setState(() {
-      _themeMode = isDark ? ThemeMode.dark : ThemeMode.light;
-    });
-  }
+  void _toggleTheme(bool isDark) => setState(() => _themeMode = isDark ? ThemeMode.dark : ThemeMode.light);
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Lumina',
       debugShowCheckedModeBanner: false,
       themeMode: _themeMode,
       theme: ThemeData(
@@ -66,10 +185,7 @@ class _LuminaAppState extends State<LuminaApp> {
         ),
         fontFamily: 'Roboto',
       ),
-      home: MusicLibraryPage(
-        themeMode: _themeMode,
-        onThemeChanged: _toggleTheme,
-      ),
+      home: MusicLibraryPage(themeMode: _themeMode, onThemeChanged: _toggleTheme),
     );
   }
 }
@@ -77,12 +193,7 @@ class _LuminaAppState extends State<LuminaApp> {
 class MusicLibraryPage extends StatefulWidget {
   final ThemeMode themeMode;
   final Function(bool) onThemeChanged;
-
-  const MusicLibraryPage({
-    super.key,
-    required this.themeMode,
-    required this.onThemeChanged,
-  });
+  const MusicLibraryPage({super.key, required this.themeMode, required this.onThemeChanged});
 
   @override
   State<MusicLibraryPage> createState() => _MusicLibraryPageState();
@@ -90,55 +201,43 @@ class MusicLibraryPage extends StatefulWidget {
 
 class _MusicLibraryPageState extends State<MusicLibraryPage> {
   final OnAudioQuery _audioQuery = OnAudioQuery();
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  
   int _selectedIndex = 0;
   final List<SongModel> _songs = [];
   final Set<int> _favoriteIds = {};
   final List<PlaylistModelCustom> _playlists = [];
   PlaylistModelCustom? _selectedPlaylist;
-  List<SongModel> _currentPlaylistSongs = [];
   bool _isLoading = true;
   String _searchQuery = "";
   String _playlistSearchQuery = "";
-  
-  SongModel? _currentSong;
-  bool _isPlaying = false;
-  bool _isShuffle = false;
 
   @override
   void initState() {
     super.initState();
-    _requestPermissions();
-    
-    _audioPlayer.playerStateStream.listen((state) {
-      if (mounted) {
-        setState(() {
-          _isPlaying = state.playing;
-        });
-        if (state.processingState == ProcessingState.completed) {
-          _playNext();
-        }
-      }
+    // EJECUCIÓN SEGURA: Esperamos a que la Activity esté vinculada
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _requestPermissions();
     });
   }
 
-  @override
-  void dispose() {
-    _audioPlayer.dispose();
-    super.dispose();
-  }
-
   Future<void> _requestPermissions() async {
-    Map<Permission, PermissionStatus> statuses = await [
-      Permission.storage,
-      Permission.audio,
-    ].request();
+    try {
+      // 1. Pedir permisos de audio y almacenamiento
+      final status = await [
+        Permission.audio,
+        Permission.storage,
+      ].request();
 
-    if (statuses[Permission.audio]!.isGranted || statuses[Permission.storage]!.isGranted) {
-      _loadSongs();
-    } else {
-      setState(() => _isLoading = false);
+      // 2. Pedir notificaciones
+      await Permission.notification.request();
+
+      if (status[Permission.audio]!.isGranted || status[Permission.storage]!.isGranted) {
+        _loadSongs();
+      } else {
+        if (mounted) setState(() => _isLoading = false);
+      }
+    } catch (e) {
+      debugPrint("Error en permisos: $e");
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -211,62 +310,31 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Future<void> _playSong(SongModel song, {List<SongModel>? fromList}) async {
-    setState(() {
-      _currentSong = song;
-      if (fromList != null) {
-        _currentPlaylistSongs = fromList;
-      } else {
-        _currentPlaylistSongs = [];
-      }
-    });
+    final listToPlay = fromList ?? (_filteredSongs.isNotEmpty ? _filteredSongs : _songs);
+    final mediaItems = listToPlay.map((s) => MediaItem(
+      id: '${s.id}',
+      album: s.album ?? "Desconocido",
+      title: s.title,
+      artist: s.artist ?? "Desconocido",
+      artUri: Uri.parse('content://media/external/audio/media/${s.id}/albumart'),
+      extras: {'url': s.data},
+    )).toList();
+
+    final index = listToPlay.indexWhere((s) => s.id == song.id);
     
-    try {
-      await _audioPlayer.setAudioSource(AudioSource.uri(Uri.parse(song.data)));
-      _audioPlayer.play();
-    } catch (e) {
-      debugPrint("Error al reproducir: $e");
-    }
+    await _audioHandler.addQueueItems(mediaItems);
+    await _audioHandler.skipToQueueItem(index != -1 ? index : 0);
+    _audioHandler.play();
   }
 
   void _playPlaylist(List<SongModel> playlistSongs, {bool shuffle = false}) async {
     if (playlistSongs.isEmpty) return;
-    
-    List<SongModel> playList = List.from(playlistSongs);
     if (shuffle) {
-      playList.shuffle();
-    }
-    
-    setState(() {
-      _isShuffle = shuffle;
-      _currentPlaylistSongs = playlistSongs;
-    });
-    
-    _playSong(playList[0], fromList: playlistSongs);
-  }
-
-  void _playNext() {
-    final list = _currentPlaylistSongs.isNotEmpty 
-        ? _currentPlaylistSongs 
-        : (_filteredSongs.isNotEmpty ? _filteredSongs : _songs);
-    if (list.isEmpty) return;
-    int nextIndex;
-    if (_isShuffle) {
-      nextIndex = Random().nextInt(list.length);
+      await _audioHandler.setShuffleMode(AudioServiceShuffleMode.all);
     } else {
-      int currentIndex = list.indexWhere((s) => s.id == _currentSong?.id);
-      nextIndex = (currentIndex + 1) % list.length;
+      await _audioHandler.setShuffleMode(AudioServiceShuffleMode.none);
     }
-    _playSong(list[nextIndex], fromList: _currentPlaylistSongs.isNotEmpty ? _currentPlaylistSongs : null);
-  }
-
-  void _playPrevious() {
-    final list = _currentPlaylistSongs.isNotEmpty 
-        ? _currentPlaylistSongs 
-        : (_filteredSongs.isNotEmpty ? _filteredSongs : _songs);
-    if (list.isEmpty) return;
-    int currentIndex = list.indexWhere((s) => s.id == _currentSong?.id);
-    int prevIndex = (currentIndex - 1 < 0) ? list.length - 1 : currentIndex - 1;
-    _playSong(list[prevIndex], fromList: _currentPlaylistSongs.isNotEmpty ? _currentPlaylistSongs : null);
+    _playSong(playlistSongs[0], fromList: playlistSongs);
   }
 
   @override
@@ -282,8 +350,15 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         body: Stack(
           children: [
             _buildMainContent(),
-            if (_currentSong != null)
-              Positioned(bottom: 0, left: 0, right: 0, child: _buildMiniPlayer()),
+            StreamBuilder<MediaItem?>(
+              stream: _audioHandler.mediaItem,
+              builder: (context, snapshot) {
+                if (snapshot.hasData && snapshot.data != null) {
+                  return Positioned(bottom: 0, left: 0, right: 0, child: _buildMiniPlayer(snapshot.data!));
+                }
+                return const SizedBox.shrink();
+              },
+            ),
           ],
         ),
         bottomNavigationBar: _buildBottomNavBar(),
@@ -339,7 +414,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                           ),
               ),
             ),
-            if (_currentSong != null) const SizedBox(height: 85),
+            StreamBuilder<MediaItem?>(
+              stream: _audioHandler.mediaItem,
+              builder: (context, snapshot) {
+                if (snapshot.hasData) return const SizedBox(height: 85);
+                return const SizedBox.shrink();
+              },
+            ),
           ],
         ),
       ),
@@ -391,7 +472,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       itemBuilder: (context, index) => _buildMusicCard(favorites[index]),
                     ),
             ),
-            if (_currentSong != null) const SizedBox(height: 85),
+            StreamBuilder<MediaItem?>(
+              stream: _audioHandler.mediaItem,
+              builder: (context, snapshot) {
+                if (snapshot.hasData) return const SizedBox(height: 85);
+                return const SizedBox.shrink();
+              },
+            ),
           ],
         ),
       ),
@@ -460,7 +547,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       itemBuilder: (context, index) => _buildPlaylistGridCard(filteredPlaylists[index]),
                     ),
             ),
-            if (_currentSong != null) const SizedBox(height: 85),
+            StreamBuilder<MediaItem?>(
+              stream: _audioHandler.mediaItem,
+              builder: (context, snapshot) {
+                if (snapshot.hasData) return const SizedBox(height: 85);
+                return const SizedBox.shrink();
+              },
+            ),
           ],
         ),
       ),
@@ -1080,7 +1173,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 ),
               ),
             ),
-            if (_currentSong != null) const SizedBox(height: 85),
+            StreamBuilder<MediaItem?>(
+              stream: _audioHandler.mediaItem,
+              builder: (context, snapshot) {
+                if (snapshot.hasData) return const SizedBox(height: 85);
+                return const SizedBox.shrink();
+              },
+            ),
           ],
         ),
       ),
@@ -1104,62 +1203,68 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Widget _buildMusicCard(SongModel song) {
-    bool isSelected = _currentSong?.id == song.id;
+    bool isSelected = false;
     final colorScheme = Theme.of(context).colorScheme;
     
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: isSelected ? const Color(0xFF6C63FF).withValues(alpha: 0.1) : colorScheme.surface,
-        borderRadius: BorderRadius.circular(15),
-      ),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
-        leading: SizedBox(
-          width: 50,
-          height: 50,
-          child: ClipOval(
-            child: QueryArtworkWidget(
-              id: song.id,
-              type: ArtworkType.AUDIO,
-              artworkWidth: 50,
-              artworkHeight: 50,
-              artworkFit: BoxFit.cover,
-              nullArtworkWidget: Container(
-                width: 50,
-                height: 50,
-                decoration: BoxDecoration(
-                  color: colorScheme.onSurface.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
+    return StreamBuilder<MediaItem?>(
+      stream: _audioHandler.mediaItem,
+      builder: (context, snapshot) {
+        isSelected = snapshot.data?.id == '${song.id}';
+        return Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          decoration: BoxDecoration(
+            color: isSelected ? const Color(0xFF6C63FF).withValues(alpha: 0.1) : colorScheme.surface,
+            borderRadius: BorderRadius.circular(15),
+          ),
+          child: ListTile(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+            leading: SizedBox(
+              width: 50,
+              height: 50,
+              child: ClipOval(
+                child: QueryArtworkWidget(
+                  id: song.id,
+                  type: ArtworkType.AUDIO,
+                  artworkWidth: 50,
+                  artworkHeight: 50,
+                  artworkFit: BoxFit.cover,
+                  nullArtworkWidget: Container(
+                    width: 50,
+                    height: 50,
+                    decoration: BoxDecoration(
+                      color: colorScheme.onSurface.withValues(alpha: 0.1),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.music_note, color: Color(0xFF6C63FF), size: 28),
+                  ),
                 ),
-                child: const Icon(Icons.music_note, color: Color(0xFF6C63FF), size: 28),
               ),
             ),
+            title: Text(
+              song.title, 
+              maxLines: 1, 
+              overflow: TextOverflow.ellipsis, 
+              style: TextStyle(
+                color: isSelected ? const Color(0xFF6C63FF) : colorScheme.onSurface, 
+                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal
+              )
+            ),
+            subtitle: Text(
+              song.artist ?? "Desconocido", 
+              maxLines: 1, 
+              style: TextStyle(color: colorScheme.onSurface.withValues(alpha: 0.6), fontSize: 13)
+            ),
+            trailing: _favoriteIds.contains(song.id) 
+                ? const Icon(Icons.favorite, color: Color(0xFF4CAF50), size: 20)
+                : null,
+            onTap: () => _playSong(song),
           ),
-        ),
-        title: Text(
-          song.title, 
-          maxLines: 1, 
-          overflow: TextOverflow.ellipsis, 
-          style: TextStyle(
-            color: isSelected ? const Color(0xFF6C63FF) : colorScheme.onSurface, 
-            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal
-          )
-        ),
-        subtitle: Text(
-          song.artist ?? "Desconocido", 
-          maxLines: 1, 
-          style: TextStyle(color: colorScheme.onSurface.withValues(alpha: 0.6), fontSize: 13)
-        ),
-        trailing: _favoriteIds.contains(song.id) 
-            ? const Icon(Icons.favorite, color: Color(0xFF4CAF50), size: 20)
-            : null,
-        onTap: () => _playSong(song),
-      ),
+        );
+      },
     );
   }
 
-  Widget _buildMiniPlayer() {
+  Widget _buildMiniPlayer(MediaItem item) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return GestureDetector(
       onTap: () => _showFullPlayer(),
@@ -1183,7 +1288,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
               child: QueryArtworkWidget(
-                id: _currentSong!.id, 
+                id: int.parse(item.id), 
                 type: ArtworkType.AUDIO, 
                 size: 300, 
                 artworkFit: BoxFit.cover,
@@ -1195,15 +1300,24 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(_currentSong!.title, style: TextStyle(fontWeight: FontWeight.bold, color: Theme.of(context).colorScheme.onSurface), maxLines: 1, overflow: TextOverflow.ellipsis),
-                  Text(_currentSong!.artist ?? "Desconocido", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6))),
+                  Text(item.title, style: TextStyle(fontWeight: FontWeight.bold, color: Theme.of(context).colorScheme.onSurface), maxLines: 1, overflow: TextOverflow.ellipsis),
+                  Text(item.artist ?? "Desconocido", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6))),
                 ],
               ),
             ),
-            IconButton(icon: Icon(Icons.skip_next_rounded, color: Theme.of(context).colorScheme.onSurface), onPressed: _playNext),
             IconButton(
-              icon: Icon(_isPlaying ? Icons.pause_circle_filled_rounded : Icons.play_circle_filled_rounded, size: 40, color: const Color(0xFF4CAF50)),
-              onPressed: () => _isPlaying ? _audioPlayer.pause() : _audioPlayer.play(),
+              icon: Icon(Icons.skip_next_rounded, color: Theme.of(context).colorScheme.onSurface), 
+              onPressed: () => _audioHandler.skipToNext(),
+            ),
+            StreamBuilder<PlaybackState>(
+              stream: _audioHandler.playbackState,
+              builder: (context, snapshot) {
+                final playing = snapshot.data?.playing ?? false;
+                return IconButton(
+                  icon: Icon(playing ? Icons.pause_circle_filled_rounded : Icons.play_circle_filled_rounded, size: 40, color: const Color(0xFF4CAF50)),
+                  onPressed: () => playing ? _audioHandler.pause() : _audioHandler.play(),
+                );
+              },
             ),
           ],
         ),
@@ -1216,19 +1330,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setModalState) {
-          return _FullPlayerScreen(
-            song: _currentSong!,
-            player: _audioPlayer,
-            isShuffle: _isShuffle,
-            isFavorite: _favoriteIds.contains(_currentSong!.id),
-            onNext: () { _playNext(); setModalState(() {}); },
-            onPrevious: () { _playPrevious(); setModalState(() {}); },
-            onShuffle: () { setState(() => _isShuffle = !_isShuffle); setModalState(() {}); },
-            onToggleFavorite: () { _toggleFavorite(_currentSong!.id); setModalState(() {}); },
-          );
-        }
+      builder: (context) => _FullPlayerScreen(
+        audioHandler: _audioHandler,
+        favoriteIds: _favoriteIds,
+        onToggleFavorite: _toggleFavorite,
       ),
     );
   }
@@ -1510,23 +1615,13 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
 }
 
 class _FullPlayerScreen extends StatelessWidget {
-  final SongModel song;
-  final AudioPlayer player;
-  final bool isShuffle;
-  final bool isFavorite;
-  final VoidCallback onNext;
-  final VoidCallback onPrevious;
-  final VoidCallback onShuffle;
-  final VoidCallback onToggleFavorite;
+  final AudioHandler audioHandler;
+  final Set<int> favoriteIds;
+  final Function(int) onToggleFavorite;
 
   const _FullPlayerScreen({
-    required this.song,
-    required this.player,
-    required this.isShuffle,
-    required this.isFavorite,
-    required this.onNext,
-    required this.onPrevious,
-    required this.onShuffle,
+    required this.audioHandler,
+    required this.favoriteIds,
     required this.onToggleFavorite,
   });
 
@@ -1535,70 +1630,105 @@ class _FullPlayerScreen extends StatelessWidget {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final onSurface = isDark ? Colors.white : Colors.black87;
 
-    return Container(
-      height: MediaQuery.of(context).size.height,
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
-      ),
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 30),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              Column(
+    return StreamBuilder<MediaItem?>(
+      stream: audioHandler.mediaItem,
+      builder: (context, snapshot) {
+        final item = snapshot.data;
+        if (item == null) return const SizedBox.shrink();
+
+        return Container(
+          height: MediaQuery.of(context).size.height,
+          decoration: BoxDecoration(
+            color: Theme.of(context).scaffoldBackgroundColor,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
+          ),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 30),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  IconButton(icon: Icon(Icons.keyboard_arrow_down, size: 35, color: onSurface), onPressed: () => Navigator.pop(context)),
-                  Text("REPRODUCIENDO", style: TextStyle(letterSpacing: 2, color: onSurface.withValues(alpha: 0.5), fontSize: 11, fontWeight: FontWeight.bold)),
-                ],
-              ),
-              Center(
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(30),
-                  child: QueryArtworkWidget(
-                    id: song.id, type: ArtworkType.AUDIO, artworkWidth: MediaQuery.of(context).size.width * 0.85, artworkHeight: MediaQuery.of(context).size.width * 0.85, size: 2000, format: ArtworkFormat.PNG,
-                    artworkFit: BoxFit.cover,
-                    nullArtworkWidget: Container(height: MediaQuery.of(context).size.width * 0.85, width: MediaQuery.of(context).size.width * 0.85, color: onSurface.withValues(alpha: 0.1), child: const Icon(Icons.music_note, size: 100, color: Color(0xFF6C63FF))),
+                  Column(
+                    children: [
+                      IconButton(icon: Icon(Icons.keyboard_arrow_down, size: 35, color: onSurface), onPressed: () => Navigator.pop(context)),
+                      Text("REPRODUCIENDO", style: TextStyle(letterSpacing: 2, color: onSurface.withValues(alpha: 0.5), fontSize: 11, fontWeight: FontWeight.bold)),
+                    ],
                   ),
-                ),
-              ),
-              Column(
-                children: [
-                  Text(song.title, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: onSurface), textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 8),
-                  Text(song.artist ?? "Desconocido", style: const TextStyle(fontSize: 18, color: Color(0xFF4CAF50))),
-                ],
-              ),
-              StreamBuilder<Duration?>(
-                stream: player.positionStream,
-                builder: (context, snapshot) {
-                  return ProgressBar(
-                    progress: snapshot.data ?? Duration.zero, total: player.duration ?? Duration.zero, progressBarColor: const Color(0xFF4CAF50), baseBarColor: onSurface.withValues(alpha: 0.1), thumbColor: onSurface, barHeight: 4, thumbRadius: 6, onSeek: (d) => player.seek(d),
-                  );
-                },
-              ),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  IconButton(icon: Icon(Icons.shuffle, color: isShuffle ? const Color(0xFF4CAF50) : onSurface.withValues(alpha: 0.5)), onPressed: onShuffle),
-                  IconButton(icon: Icon(Icons.skip_previous_rounded, size: 45, color: onSurface), onPressed: onPrevious),
-                  StreamBuilder<bool>(
-                    stream: player.playingStream,
+                  Center(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(30),
+                      child: QueryArtworkWidget(
+                        id: int.parse(item.id), type: ArtworkType.AUDIO, artworkWidth: MediaQuery.of(context).size.width * 0.85, artworkHeight: MediaQuery.of(context).size.width * 0.85, size: 2000, format: ArtworkFormat.PNG,
+                        artworkFit: BoxFit.cover,
+                        nullArtworkWidget: Container(height: MediaQuery.of(context).size.width * 0.85, width: MediaQuery.of(context).size.width * 0.85, color: onSurface.withValues(alpha: 0.1), child: const Icon(Icons.music_note, size: 100, color: Color(0xFF6C63FF))),
+                      ),
+                    ),
+                  ),
+                  Column(
+                    children: [
+                      Text(item.title, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: onSurface), textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 8),
+                      Text(item.artist ?? "Desconocido", style: const TextStyle(fontSize: 18, color: Color(0xFF4CAF50))),
+                    ],
+                  ),
+                  StreamBuilder<Duration>(
+                    stream: AudioService.position,
                     builder: (context, snapshot) {
-                      bool playing = snapshot.data ?? false;
-                      return Container(decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF1DB954)), child: IconButton(icon: Icon(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, size: 45, color: Colors.white), onPressed: () => playing ? player.pause() : player.play()));
+                      final position = snapshot.data ?? Duration.zero;
+                      return ProgressBar(
+                        progress: position,
+                        total: item.duration ?? Duration.zero,
+                        progressBarColor: const Color(0xFF4CAF50),
+                        baseBarColor: onSurface.withValues(alpha: 0.1),
+                        thumbColor: onSurface,
+                        barHeight: 4,
+                        thumbRadius: 6,
+                        onSeek: (d) => audioHandler.seek(d),
+                      );
                     },
                   ),
-                  IconButton(icon: Icon(Icons.skip_next_rounded, size: 45, color: onSurface), onPressed: onNext),
-                  IconButton(icon: Icon(isFavorite ? Icons.favorite : Icons.favorite_border, color: isFavorite ? const Color(0xFF4CAF50) : onSurface), onPressed: onToggleFavorite),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      StreamBuilder<PlaybackState>(
+                        stream: audioHandler.playbackState,
+                        builder: (context, snapshot) {
+                          final shuffleMode = snapshot.data?.shuffleMode ?? AudioServiceShuffleMode.none;
+                          final isShuffle = shuffleMode != AudioServiceShuffleMode.none;
+                          return IconButton(
+                            icon: Icon(Icons.shuffle, color: isShuffle ? const Color(0xFF4CAF50) : onSurface.withValues(alpha: 0.5)),
+                            onPressed: () => audioHandler.setShuffleMode(isShuffle ? AudioServiceShuffleMode.none : AudioServiceShuffleMode.all),
+                          );
+                        }
+                      ),
+                      IconButton(icon: Icon(Icons.skip_previous_rounded, size: 45, color: onSurface), onPressed: () => audioHandler.skipToPrevious()),
+                      StreamBuilder<PlaybackState>(
+                        stream: audioHandler.playbackState,
+                        builder: (context, snapshot) {
+                          final playing = snapshot.data?.playing ?? false;
+                          return Container(
+                            decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF1DB954)),
+                            child: IconButton(
+                              icon: Icon(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, size: 45, color: Colors.white),
+                              onPressed: () => playing ? audioHandler.pause() : audioHandler.play(),
+                            ),
+                          );
+                        },
+                      ),
+                      IconButton(icon: Icon(Icons.skip_next_rounded, size: 45, color: onSurface), onPressed: () => audioHandler.skipToNext()),
+                      IconButton(
+                        icon: Icon(favoriteIds.contains(int.parse(item.id)) ? Icons.favorite : Icons.favorite_border, color: favoriteIds.contains(int.parse(item.id)) ? const Color(0xFF4CAF50) : onSurface),
+                        onPressed: () => onToggleFavorite(int.parse(item.id)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
                 ],
               ),
-              const SizedBox(height: 10),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
