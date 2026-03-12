@@ -329,9 +329,15 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   Future<void> _refreshLibrary() async {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('Buscando nuevas canciones...'),
-        duration: Duration(seconds: 2),
-        backgroundColor: Color(0xFF6C63FF),
+        content: Text(
+          'Buscando nuevas canciones...',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            color: Colors.black, // Color oscuro para contrastar con el fondo blanco
+          ),
+        ),
+        duration: const Duration(seconds: 3),
+        backgroundColor: const Color.fromARGB(255, 255, 255, 255),
       ),
     );
     await _loadSongs();
@@ -1593,9 +1599,18 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 fontSize: 13,
               ),
             ),
-            trailing: _favoriteIds.contains(song.id)
-                ? const Icon(Icons.favorite, color: Color(0xFF4CAF50), size: 20)
-                : null,
+            trailing: IconButton(
+              icon: Icon(
+                _favoriteIds.contains(song.id)
+                    ? Icons.favorite
+                    : Icons.favorite_border,
+                color: _favoriteIds.contains(song.id)
+                    ? const Color(0xFF4CAF50)
+                    : colorScheme.onSurface.withOpacity(0.5),
+                size: 20,
+              ),
+              onPressed: () => _toggleFavorite(song.id),
+            ),
             onTap: () => _playSong(song),
           ),
         );
