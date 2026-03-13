@@ -41,6 +41,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> _initPlayer() async {
     try {
       await _player.setAudioSource(_playlist);
+      await _player.setLoopMode(LoopMode.all); // Infinite loop playback
       _notifyAudioHandlerAboutPlaybackEvents();
       _listenForSequenceStateChanges();
     } catch (e) {
@@ -96,7 +97,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   void _listenForSequenceStateChanges() {
     _player.sequenceStateStream.listen((SequenceState? sequenceState) {
-      final sequence = sequenceState?.effectiveSequence;
+      final sequence = sequenceState?.sequence;
       if (sequence == null || sequence.isEmpty) return;
 
       // Actualizar queue
@@ -118,7 +119,33 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     );
     await _playlist.clear();
     await _playlist.addAll(audioSources.toList());
+
+    // Si el modo aleatorio está encendido, baraja de nuevo los elementos recién añadidos - canciones
+    if (_player.shuffleModeEnabled) {
+      await _player.shuffle();
+    }
+
     queue.add(mediaItems);
+  }
+
+  @override
+  Future<void> addQueueItem(MediaItem mediaItem) async {
+    final audioSource = AudioSource.uri(
+      Uri.parse(mediaItem.extras!['url']),
+      tag: mediaItem,
+    );
+
+    // Insertar justo después de la canción actual (Reproducir a continuación)
+    int insertIndex = _playlist.length;
+    if (_player.currentIndex != null) {
+      insertIndex = _player.currentIndex! + 1;
+    }
+
+    await _playlist.insert(insertIndex, audioSource);
+
+    // just_audio emitirá el nuevo "sequenceStateStream" y nuestra función
+    // _listenForSequenceStateChanges actualizará la queue de la interfaz automáticamente,
+    // así que no necesitamos modificar 'queue.value' manualmente aquí.
   }
 
   @override
@@ -128,9 +155,30 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> seek(Duration position) => _player.seek(position);
   @override
-  Future<void> skipToNext() => _player.seekToNext();
+  Future<void> skipToNext() async {
+    if (_player.hasNext) {
+      await _player.seekToNext();
+    } else {
+      // Wrap around explicitly when there's no next item
+      if (_player.shuffleModeEnabled) {
+        await _player.shuffle(); // Reshuffle for a truly infinite random feel
+      }
+      // Seek to the beginning of the sequence (either original or shuffled)
+      int nextIndex = _player.effectiveIndices?.first ?? 0;
+      await _player.seek(Duration.zero, index: nextIndex);
+    }
+  }
+
   @override
-  Future<void> skipToPrevious() => _player.seekToPrevious();
+  Future<void> skipToPrevious() async {
+    if (_player.hasPrevious) {
+      await _player.seekToPrevious();
+    } else {
+      // Loop back to the end of the playlist
+      int lastIndex = _player.effectiveIndices?.last ?? (_playlist.length - 1);
+      await _player.seek(Duration.zero, index: lastIndex);
+    }
+  }
   @override
   Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
     final enabled = shuffleMode != AudioServiceShuffleMode.none;
@@ -148,6 +196,32 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> stop() async {
     await _player.stop();
     return super.stop();
+  }
+}
+
+class AppHelpers {
+  static Widget getRandomDefaultCover({
+    required BuildContext context,
+    required int id,
+    double? width,
+    double? height,
+  }) {
+    final coverIndex = (id.hashCode).abs() % 5 + 1;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        image: DecorationImage(
+          image: AssetImage('assets/covers/cover_$coverIndex.png'),
+          fit: BoxFit.cover,
+        ),
+      ),
+      child: isDark 
+          ? Container(color: Colors.black.withValues(alpha: 0.3)) 
+          : null,
+    );
   }
 }
 
@@ -333,7 +407,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           'Buscando nuevas canciones...',
           style: TextStyle(
             fontWeight: FontWeight.bold,
-            color: Colors.black, // Color oscuro para contrastar con el fondo blanco
+            color: Colors
+                .black, // Color oscuro para contrastar con el fondo blanco
           ),
         ),
         duration: const Duration(seconds: 3),
@@ -478,6 +553,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
     _playSong(playlistSongs[0], fromList: playlistSongs);
   }
+
+
 
   @override
   Widget build(BuildContext context) {
@@ -875,13 +952,9 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           type: ArtworkType.AUDIO,
           size: 500,
           artworkFit: BoxFit.cover,
-          nullArtworkWidget: Container(
-            color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[200],
-            child: Icon(
-              Icons.music_note_rounded,
-              size: 50,
-              color: colorScheme.primary.withValues(alpha: 0.5),
-            ),
+          nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+            context: context,
+            id: playlist.songs[0].id,
           ),
         ),
       );
@@ -934,12 +1007,9 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     id: playlist.songs[i].id,
                     type: ArtworkType.AUDIO,
                     artworkFit: BoxFit.cover,
-                    nullArtworkWidget: Container(
-                      color: Colors.grey[800],
-                      child: const Icon(
-                        Icons.music_note,
-                        color: Colors.white24,
-                      ),
+                    nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                      context: context,
+                      id: playlist.songs[i].id,
                     ),
                   ),
                 ),
@@ -978,7 +1048,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         id: playlist.songs[i].id,
         type: ArtworkType.AUDIO,
         artworkFit: BoxFit.cover,
-        nullArtworkWidget: Container(color: Colors.grey[900]),
+        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+          context: context,
+          id: playlist.songs[i].id,
+        ),
       ),
     );
   }
@@ -1033,14 +1106,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     artworkWidth: 55,
                     artworkHeight: 55,
                     artworkFit: BoxFit.cover,
-                    nullArtworkWidget: Container(
+                    nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                      context: context,
+                      id: song.id,
                       width: 55,
                       height: 55,
-                      color: Colors.white12,
-                      child: const Icon(
-                        Icons.music_note,
-                        color: Colors.white30,
-                      ),
                     ),
                   ),
                 ),
@@ -1074,21 +1144,26 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     ),
                   ),
                 ),
-                IconButton(
-                  icon: Icon(
-                    isFavorite ? Icons.favorite : Icons.favorite_border,
-                    color: isFavorite
-                        ? const Color(0xFF4CAF50)
-                        : colorScheme.onSurface.withValues(alpha: 0.5),
-                  ),
-                  onPressed: () => _toggleFavorite(song.id),
-                ),
-                IconButton(
-                  icon: Icon(
-                    Icons.more_vert_rounded,
-                    color: colorScheme.onSurface.withValues(alpha: 0.5),
-                  ),
-                  onPressed: () {},
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        isFavorite ? Icons.favorite : Icons.favorite_border,
+                        color: isFavorite
+                            ? const Color(0xFF4CAF50)
+                            : colorScheme.onSurface.withValues(alpha: 0.5),
+                      ),
+                      onPressed: () => _toggleFavorite(song.id),
+                    ),
+                    IconButton(
+                      icon: Icon(
+                        Icons.more_vert_rounded,
+                        color: colorScheme.onSurface.withValues(alpha: 0.5),
+                      ),
+                      onPressed: () => _showSongOptions(context, song),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -1533,6 +1608,253 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
+  void _showSongOptions(BuildContext context, SongModel song) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: isDark ? const Color(0xFF1A1A1A) : Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 40,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.withOpacity(0.3),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                const SizedBox(height: 15),
+                ListTile(
+                  leading: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: QueryArtworkWidget(
+                      id: song.id,
+                      type: ArtworkType.AUDIO,
+                      artworkWidth: 40,
+                      artworkHeight: 40,
+                      nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                        context: context,
+                        id: song.id,
+                        width: 40,
+                        height: 40,
+                      ),
+                    ),
+                  ),
+                  title: Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: Text(
+                    song.artist ?? "Desconocido",
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.playlist_add_rounded),
+                  title: const Text('Agregar a lista de reproducción'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _showAddToPlaylistDialog(song);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.queue_music_rounded),
+                  title: const Text('Añadir a la cola de reproducción'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _addToQueue(song);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(
+                    Icons.visibility_off_rounded,
+                    color: Colors.red,
+                  ),
+                  title: const Text(
+                    'Ocultar canción (Eliminar de la vista)',
+                    style: TextStyle(color: Colors.red),
+                  ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _deleteSong(song);
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showAddToPlaylistDialog(SongModel song) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Agregar a...'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: _playlists.isEmpty
+                ? const Text('No tienes listas creadas aún.')
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: _playlists.length + 1, // +1 for "Create new"
+                    itemBuilder: (context, index) {
+                      if (index == _playlists.length) {
+                        return ListTile(
+                          leading: const Icon(Icons.add),
+                          title: const Text('Crear nueva lista'),
+                          onTap: () {
+                            Navigator.pop(context);
+                            _openCreatePlaylistWithSong(song);
+                          },
+                        );
+                      }
+                      final playlist = _playlists[index];
+                      final alreadyAdded = playlist.songs.any(
+                        (s) => s.id == song.id,
+                      );
+                      return ListTile(
+                        leading: const Icon(Icons.queue_music),
+                        title: Text(playlist.name),
+                        trailing: alreadyAdded
+                            ? const Icon(Icons.check, color: Colors.green)
+                            : null,
+                        onTap: () {
+                          Navigator.pop(context);
+                          if (!alreadyAdded) {
+                            setState(() {
+                              playlist.songs.add(song);
+                            });
+                            _savePlaylists();
+                            ScaffoldMessenger.of(this.context).showSnackBar(
+                              SnackBar(
+                                content: Text('Agregada a "${playlist.name}"'),
+                                backgroundColor: const Color(0xFF6C63FF),
+                              ),
+                            );
+                          }
+                        },
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('CANCELAR'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _openCreatePlaylistWithSong(SongModel song) async {
+    final defaultName = "Lista ${_playlists.length + 1}";
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CreatePlaylistScreen(
+          availableSongs: _songs,
+          defaultName: defaultName,
+        ),
+      ),
+    );
+
+    if (result != null && result is PlaylistModelCustom) {
+      if (!result.songs.any((s) => s.id == song.id)) {
+        result.songs.add(song);
+      }
+      setState(() {
+        _playlists.add(result);
+      });
+      _savePlaylists();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Lista creada y canción agregada'),
+          backgroundColor: Color.fromARGB(255, 255, 255, 255),
+        ),
+      );
+    }
+  }
+
+  void _addToQueue(SongModel song) {
+    final mediaItem = MediaItem(
+      id: '${song.id}',
+      album: song.album ?? "Desconocido",
+      title: song.title,
+      artist: song.artist ?? "Desconocido",
+      artUri: Uri.parse(
+        'content://media/external/audio/media/${song.id}/albumart',
+      ),
+      duration: Duration(milliseconds: song.duration ?? 0),
+      extras: {'url': song.data},
+    );
+    _audioHandler.addQueueItem(mediaItem);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Añadida a la cola de reproducción',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black),
+        ),
+        backgroundColor: Color.fromARGB(255, 255, 255, 255),
+      ),
+    );
+  }
+
+  void _deleteSong(SongModel song) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ocultar canción'),
+        content: Text(
+          'Debido a restricciones de Android, la canción no se borrará de tu teléfono centralmente, pero se ocultará de Lumina Player.\n\n¿Deseas ocultar "${song.title}"?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCELAR'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() {
+                _songs.removeWhere((s) => s.id == song.id);
+                // Also remove from favorites if it was there
+                if (_favoriteIds.contains(song.id)) {
+                  _favoriteIds.remove(song.id);
+                  _saveFavorites();
+                }
+              });
+              ScaffoldMessenger.of(this.context).showSnackBar(
+                const SnackBar(
+                  content: Text('Canción ocultada exitosamente'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            },
+            child: const Text('OCULTAR', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildMusicCard(SongModel song) {
     bool isSelected = false;
     final colorScheme = Theme.of(context).colorScheme;
@@ -1564,18 +1886,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   artworkWidth: 50,
                   artworkHeight: 50,
                   artworkFit: BoxFit.cover,
-                  nullArtworkWidget: Container(
+                  nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                    context: context,
+                    id: song.id,
                     width: 50,
                     height: 50,
-                    decoration: BoxDecoration(
-                      color: colorScheme.onSurface.withOpacity(0.1),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.music_note,
-                      color: Color(0xFF4CAF50),
-                      size: 28,
-                    ),
                   ),
                 ),
               ),
@@ -1599,17 +1914,30 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 fontSize: 13,
               ),
             ),
-            trailing: IconButton(
-              icon: Icon(
-                _favoriteIds.contains(song.id)
-                    ? Icons.favorite
-                    : Icons.favorite_border,
-                color: _favoriteIds.contains(song.id)
-                    ? const Color(0xFF4CAF50)
-                    : colorScheme.onSurface.withOpacity(0.5),
-                size: 20,
-              ),
-              onPressed: () => _toggleFavorite(song.id),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: Icon(
+                    _favoriteIds.contains(song.id)
+                        ? Icons.favorite
+                        : Icons.favorite_border,
+                    color: _favoriteIds.contains(song.id)
+                        ? const Color(0xFF4CAF50)
+                        : colorScheme.onSurface.withOpacity(0.5),
+                    size: 20,
+                  ),
+                  onPressed: () => _toggleFavorite(song.id),
+                ),
+                IconButton(
+                  icon: Icon(
+                    Icons.more_vert_rounded,
+                    color: colorScheme.onSurface.withOpacity(0.5),
+                    size: 20,
+                  ),
+                  onPressed: () => _showSongOptions(context, song),
+                ),
+              ],
             ),
             onTap: () => _playSong(song),
           ),
@@ -1644,9 +1972,16 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               child: QueryArtworkWidget(
                 id: int.parse(item.id),
                 type: ArtworkType.AUDIO,
+                artworkWidth: 55,
+                artworkHeight: 55,
                 size: 300,
                 artworkFit: BoxFit.cover,
-                nullArtworkWidget: const Icon(Icons.music_note),
+                nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                  context: context,
+                  id: int.parse(item.id),
+                  width: 55,
+                  height: 55,
+                ),
               ),
             ),
             const SizedBox(width: 15),
@@ -2213,15 +2548,11 @@ class _FullPlayerScreenState extends State<_FullPlayerScreen> {
                         size: 2000,
                         format: ArtworkFormat.PNG,
                         artworkFit: BoxFit.cover,
-                        nullArtworkWidget: Container(
-                          height: MediaQuery.of(context).size.width * 0.85,
+                        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                          context: context,
+                          id: int.parse(item.id),
                           width: MediaQuery.of(context).size.width * 0.85,
-                          color: onSurface.withValues(alpha: 0.1),
-                          child: const Icon(
-                            Icons.music_note,
-                            size: 100,
-                            color: Color(0xFF6C63FF),
-                          ),
+                          height: MediaQuery.of(context).size.width * 0.85,
                         ),
                       ),
                     ),
