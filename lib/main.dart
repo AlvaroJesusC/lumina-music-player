@@ -62,6 +62,20 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     final playing = _player.playing;
     final queueIndex = _player.currentIndex;
 
+    // Si la lista está vacía, forzamos el estado idle para evitar que el servicio
+    // en primer plano (y la notificación) se activen sin que el usuario haya reproducido algo.
+    final processingState =
+        (_player.processingState == ProcessingState.ready &&
+            _playlist.length == 0)
+        ? AudioProcessingState.idle
+        : const {
+            ProcessingState.idle: AudioProcessingState.idle,
+            ProcessingState.loading: AudioProcessingState.loading,
+            ProcessingState.buffering: AudioProcessingState.buffering,
+            ProcessingState.ready: AudioProcessingState.ready,
+            ProcessingState.completed: AudioProcessingState.completed,
+          }[_player.processingState]!;
+
     playbackState.add(
       playbackState.value.copyWith(
         controls: [
@@ -76,13 +90,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           MediaAction.setShuffleMode,
         },
         androidCompactActionIndices: const [0, 1, 2],
-        processingState: const {
-          ProcessingState.idle: AudioProcessingState.idle,
-          ProcessingState.loading: AudioProcessingState.loading,
-          ProcessingState.buffering: AudioProcessingState.buffering,
-          ProcessingState.ready: AudioProcessingState.ready,
-          ProcessingState.completed: AudioProcessingState.completed,
-        }[_player.processingState]!,
+        processingState: processingState,
         playing: playing,
         updatePosition: _player.position,
         bufferedPosition: _player.bufferedPosition,
@@ -179,6 +187,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       await _player.seek(Duration.zero, index: lastIndex);
     }
   }
+
   @override
   Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) async {
     final enabled = shuffleMode != AudioServiceShuffleMode.none;
@@ -196,6 +205,15 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> stop() async {
     await _player.stop();
     return super.stop();
+  }
+
+  @override
+  Future<void> onTaskRemoved() async {
+    // Si el usuario cierra la app deslizando de recientes, y está en pausa,
+    // matamos el servicio para que desaparezca la notificación fantasma.
+    if (!_player.playing) {
+      await stop();
+    }
   }
 }
 
@@ -218,8 +236,8 @@ class AppHelpers {
           fit: BoxFit.cover,
         ),
       ),
-      child: isDark 
-          ? Container(color: Colors.black.withValues(alpha: 0.3)) 
+      child: isDark
+          ? Container(color: Colors.black.withValues(alpha: 0.3))
           : null,
     );
   }
@@ -295,9 +313,9 @@ class _LuminaAppState extends State<LuminaApp> {
         brightness: Brightness.light,
         scaffoldBackgroundColor: Colors.white,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF6C63FF),
+          seedColor: const Color(0xFF4CAF50),
           brightness: Brightness.light,
-          primary: const Color(0xFF6C63FF),
+          primary: const Color(0xFF4CAF50),
           secondary: const Color(0xFF4CAF50),
           surface: const Color(0xFFF5F5F5),
           onSurface: Colors.black87,
@@ -309,16 +327,136 @@ class _LuminaAppState extends State<LuminaApp> {
         brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF0A0A0A),
         colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF6C63FF),
+          primary: Color(0xFF4CAF50),
           secondary: Color(0xFF4CAF50),
           surface: Color(0xFF1A1A1A),
           onSurface: Colors.white,
         ),
         fontFamily: 'Roboto',
       ),
-      home: MusicLibraryPage(
-        themeMode: _themeMode,
-        onThemeChanged: _toggleTheme,
+      home: SplashScreen(themeMode: _themeMode, onThemeChanged: _toggleTheme),
+    );
+  }
+}
+
+class SplashScreen extends StatefulWidget {
+  final ThemeMode themeMode;
+  final Function(bool) onThemeChanged;
+  const SplashScreen({
+    super.key,
+    required this.themeMode,
+    required this.onThemeChanged,
+  });
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  final List<String> _chunks = [
+    "Lumina,",
+    "ilumina tu vida",
+    "con música", // Últimas dos palabras juntas
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    // 5 chunks, 1 segundo por chunk => 5 segundos en total
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 3000),
+    );
+
+    _controller.forward();
+
+    // Damos 1 segundo extra para que se vea el resultado final y recien cambiamos
+    Future.delayed(const Duration(milliseconds: 4000), () {
+      if (mounted) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+            builder: (_) => MusicLibraryPage(
+              themeMode: widget.themeMode,
+              onThemeChanged: widget.onThemeChanged,
+            ),
+          ),
+        );
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final color = isDark ? Colors.white : Colors.black87;
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Image.asset('assets/iconoApp.png', width: 150, height: 150),
+            const SizedBox(height: 20),
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 6.0,
+              runSpacing: 4.0,
+              children: List.generate(_chunks.length, (index) {
+                // Cada chunk comienza exactamente a su fraccion de tiempo
+                // index 0 -> 0.0, index 1 -> 0.2, index 2 -> 0.4... (cada 1 segundo)
+                final double start = index / _chunks.length;
+                // Cada animación de aparición dura 0.2 (1 segundo de 5)
+                final double end = (start + 0.2).clamp(0.0, 1.0);
+
+                final Animation<double> slideAnimation =
+                    Tween<double>(begin: 20.0, end: 0.0).animate(
+                      CurvedAnimation(
+                        parent: _controller,
+                        curve: Interval(start, end, curve: Curves.easeOutCubic),
+                      ),
+                    );
+
+                final Animation<double> opacityAnimation =
+                    Tween<double>(begin: 0.0, end: 1.0).animate(
+                      CurvedAnimation(
+                        parent: _controller,
+                        curve: Interval(start, end, curve: Curves.easeIn),
+                      ),
+                    );
+
+                return AnimatedBuilder(
+                  animation: _controller,
+                  builder: (context, child) {
+                    return Transform.translate(
+                      offset: Offset(0, slideAnimation.value),
+                      child: Opacity(
+                        opacity: opacityAnimation.value,
+                        child: child,
+                      ),
+                    );
+                  },
+                  child: Text(
+                    _chunks[index],
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: color.withValues(alpha: 0.8),
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                );
+              }),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -516,8 +654,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Future<void> _playSong(SongModel song, {List<SongModel>? fromList}) async {
-    final listToPlay =
-        fromList ?? (_filteredSongs.isNotEmpty ? _filteredSongs : _songs);
+    final listToPlay = fromList ?? _songs;
     final mediaItems = listToPlay
         .map(
           (s) => MediaItem(
@@ -553,8 +690,6 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
     _playSong(playlistSongs[0], fromList: playlistSongs);
   }
-
-
 
   @override
   Widget build(BuildContext context) {
@@ -612,7 +747,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             Expanded(
               child: RefreshIndicator(
                 onRefresh: _refreshLibrary,
-                color: const Color(0xFF6C63FF),
+                color: const Color(0xFF4CAF50),
                 backgroundColor: Theme.of(context).colorScheme.surface,
                 child: _isLoading
                     ? const Center(child: CircularProgressIndicator())
@@ -769,7 +904,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       ),
                       child: const Icon(
                         Icons.add,
-                        color: Color(0xFF6C63FF),
+                        color: Color(0xFF4CAF50),
                         size: 24,
                       ),
                     ),
@@ -1006,6 +1141,9 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   child: QueryArtworkWidget(
                     id: playlist.songs[i].id,
                     type: ArtworkType.AUDIO,
+                    format: ArtworkFormat.JPEG,
+                    size: 2000,
+                    artworkBorder: BorderRadius.zero,
                     artworkFit: BoxFit.cover,
                     nullArtworkWidget: AppHelpers.getRandomDefaultCover(
                       context: context,
@@ -1047,6 +1185,9 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       itemBuilder: (context, i) => QueryArtworkWidget(
         id: playlist.songs[i].id,
         type: ArtworkType.AUDIO,
+        format: ArtworkFormat.JPEG,
+        size: 2000,
+        artworkBorder: BorderRadius.zero,
         artworkFit: BoxFit.cover,
         nullArtworkWidget: AppHelpers.getRandomDefaultCover(
           context: context,
@@ -1070,7 +1211,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: isPrimary
-              ? const Color(0xFF6C63FF)
+              ? const Color(0xFF4CAF50)
               : Colors.white.withValues(alpha: 0.1),
         ),
         child: Icon(icon, color: Colors.white, size: size * 0.5),
@@ -1515,7 +1656,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     icon: Icons.dark_mode_rounded,
                     title: 'Modo Oscuro',
                     trailing: Switch(
-                      value: widget.themeMode == ThemeMode.dark,
+                      value: Theme.of(context).brightness == Brightness.dark,
                       onChanged: (value) => widget.onThemeChanged(value),
                       activeThumbColor: const Color(0xFF4CAF50),
                     ),
@@ -1876,15 +2017,19 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               horizontal: 15,
               vertical: 5,
             ),
-            leading: SizedBox(
-              width: 50,
-              height: 50,
-              child: ClipOval(
+            leading: ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: SizedBox(
+                width: 50,
+                height: 50,
                 child: QueryArtworkWidget(
                   id: song.id,
                   type: ArtworkType.AUDIO,
+                  format: ArtworkFormat.JPEG,
+                  size: 2000,
                   artworkWidth: 50,
                   artworkHeight: 50,
+                  artworkBorder: BorderRadius.zero,
                   artworkFit: BoxFit.cover,
                   nullArtworkWidget: AppHelpers.getRandomDefaultCover(
                     context: context,
@@ -2191,6 +2336,7 @@ class CreatePlaylistScreen extends StatefulWidget {
 class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
   final TextEditingController _nameController = TextEditingController();
   final List<SongModel> _selectedSongs = [];
+  String _searchQuery = '';
 
   @override
   void initState() {
@@ -2311,6 +2457,32 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
               ],
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 0),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 15),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: TextField(
+                onChanged: (value) => setState(() => _searchQuery = value),
+                style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+                decoration: InputDecoration(
+                  hintText: 'Buscar canción...',
+                  hintStyle: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                  border: InputBorder.none,
+                  icon: Icon(
+                    Icons.search,
+                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
           const Divider(),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
@@ -2335,9 +2507,16 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.symmetric(horizontal: 10),
-              itemCount: widget.availableSongs.length,
+              itemCount: widget.availableSongs
+                  .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
+                               (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                  .length,
               itemBuilder: (context, index) {
-                final song = widget.availableSongs[index];
+                final filteredSongs = widget.availableSongs
+                    .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
+                                 (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                    .toList();
+                final song = filteredSongs[index];
                 final isSelected = _selectedSongs.any((s) => s.id == song.id);
                 return CheckboxListTile(
                   value: isSelected,
@@ -2359,11 +2538,25 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                   ),
                   secondary: ClipRRect(
                     borderRadius: BorderRadius.circular(10),
-                    child: QueryArtworkWidget(
-                      id: song.id,
-                      type: ArtworkType.AUDIO,
-                      artworkFit: BoxFit.cover,
-                      nullArtworkWidget: const Icon(Icons.music_note),
+                    child: SizedBox(
+                      width: 50,
+                      height: 50,
+                      child: QueryArtworkWidget(
+                        id: song.id,
+                        type: ArtworkType.AUDIO,
+                        format: ArtworkFormat.JPEG,
+                        size: 2000,
+                        artworkWidth: 50,
+                        artworkHeight: 50,
+                        artworkBorder: BorderRadius.zero,
+                        artworkFit: BoxFit.cover,
+                        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                          context: context,
+                          id: song.id,
+                          width: 50,
+                          height: 50,
+                        ),
+                      ),
                     ),
                   ),
                   onChanged: (val) {
@@ -2402,6 +2595,7 @@ class AddSongsScreen extends StatefulWidget {
 class _AddSongsScreenState extends State<AddSongsScreen> {
   final List<SongModel> _selectedToAdd = [];
   late List<SongModel> _notAddedSongs;
+  String _searchQuery = '';
 
   @override
   void initState() {
@@ -2436,12 +2630,47 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
           ),
         ],
       ),
-      body: _notAddedSongs.isEmpty
-          ? const Center(child: Text("No hay más canciones para añadir"))
-          : ListView.builder(
-              itemCount: _notAddedSongs.length,
-              itemBuilder: (context, index) {
-                final song = _notAddedSongs[index];
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 15),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: TextField(
+                onChanged: (value) => setState(() => _searchQuery = value),
+                style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+                decoration: InputDecoration(
+                  hintText: 'Buscar canción...',
+                  hintStyle: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                  border: InputBorder.none,
+                  icon: Icon(
+                    Icons.search,
+                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: _notAddedSongs.isEmpty
+                ? const Center(child: Text("No hay más canciones para añadir"))
+                : ListView.builder(
+                    itemCount: _notAddedSongs
+                        .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
+                                     (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                        .length,
+                    itemBuilder: (context, index) {
+                      final filteredSongs = _notAddedSongs
+                          .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
+                                       (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                          .toList();
+                      final song = filteredSongs[index];
                 final isSelected = _selectedToAdd.contains(song);
                 return CheckboxListTile(
                   value: isSelected,
@@ -2463,16 +2692,33 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
                   subtitle: Text(song.artist ?? "Desconocido"),
                   secondary: ClipRRect(
                     borderRadius: BorderRadius.circular(8),
-                    child: QueryArtworkWidget(
-                      id: song.id,
-                      type: ArtworkType.AUDIO,
-                      artworkFit: BoxFit.cover,
-                      nullArtworkWidget: const Icon(Icons.music_note),
+                    child: SizedBox(
+                      width: 50,
+                      height: 50,
+                      child: QueryArtworkWidget(
+                        id: song.id,
+                        type: ArtworkType.AUDIO,
+                        format: ArtworkFormat.JPEG,
+                        size: 2000,
+                        artworkWidth: 50,
+                        artworkHeight: 50,
+                        artworkBorder: BorderRadius.zero,
+                        artworkFit: BoxFit.cover,
+                        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
+                          context: context,
+                          id: song.id,
+                          width: 50,
+                          height: 50,
+                        ),
+                      ),
                     ),
                   ),
-                );
-              },
-            ),
+                    );
+                  },
+                ),
+          ),
+        ],
+      ),
     );
   }
 }
