@@ -34,6 +34,18 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final _player = AudioPlayer();
   final _playlist = ConcatenatingAudioSource(children: []);
 
+  // Overrides de metadatos: songId -> {title, artist}
+  final Map<String, Map<String, String>> _metadataOverrides = {};
+
+  MediaItem _applyOverride(MediaItem item) {
+    final ov = _metadataOverrides[item.id];
+    if (ov == null) return item;
+    return item.copyWith(
+      title: ov['title'] ?? item.title,
+      artist: ov['artist'] ?? item.artist,
+    );
+  }
+
   MyAudioHandler() {
     _initPlayer();
   }
@@ -41,7 +53,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> _initPlayer() async {
     try {
       await _player.setAudioSource(_playlist);
-      await _player.setLoopMode(LoopMode.all); // Infinite loop playback
+      await _player.setLoopMode(LoopMode.all);
       _notifyAudioHandlerAboutPlaybackEvents();
       _listenForSequenceStateChanges();
     } catch (e) {
@@ -62,8 +74,6 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     final playing = _player.playing;
     final queueIndex = _player.currentIndex;
 
-    // Si la lista está vacía, forzamos el estado idle para evitar que el servicio
-    // en primer plano (y la notificación) se activen sin que el usuario haya reproducido algo.
     final processingState =
         (_player.processingState == ProcessingState.ready &&
             _playlist.length == 0)
@@ -108,16 +118,46 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       final sequence = sequenceState?.sequence;
       if (sequence == null || sequence.isEmpty) return;
 
-      // Actualizar queue
-      final items = sequence.map((source) => source.tag as MediaItem).toList();
+      // Actualizar queue aplicando overrides de metadatos
+      final items = sequence
+          .map((source) => _applyOverride(source.tag as MediaItem))
+          .toList();
       queue.add(items);
 
-      // Actualizar mediaItem actual directamente del source actual
+      // Actualizar mediaItem actual aplicando override si existe
       final currentItem = sequenceState?.currentSource?.tag as MediaItem?;
       if (currentItem != null) {
-        mediaItem.add(currentItem);
+        mediaItem.add(_applyOverride(currentItem));
       }
     });
+  }
+
+  /// Guarda un override de titulo/artista y re-emite los streams
+  /// para actualizar el reproductor en tiempo real.
+  void updateSongTag(String songId, String newTitle, String newArtist) {
+    _metadataOverrides[songId] = {'title': newTitle, 'artist': newArtist};
+    _reEmitWithOverrides(songId);
+  }
+
+  /// Elimina el override de una cancion (restablecer al original).
+  void clearSongTagOverride(String songId) {
+    _metadataOverrides.remove(songId);
+    _reEmitWithOverrides(songId);
+  }
+
+  void _reEmitWithOverrides(String songId) {
+    final sequence = _player.sequence;
+    if (sequence != null) {
+      final updatedItems = sequence
+          .map((source) => _applyOverride(source.tag as MediaItem))
+          .toList();
+      queue.add(updatedItems);
+    }
+    final currentTag =
+        _player.sequenceState?.currentSource?.tag as MediaItem?;
+    if (currentTag != null && currentTag.id == songId) {
+      mediaItem.add(_applyOverride(currentTag));
+    }
   }
 
   @override
@@ -485,6 +525,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   bool _isLoading = true;
   String _searchQuery = "";
   String _playlistSearchQuery = "";
+  final Map<int, Map<String, String>> _customMetadata = {};
 
   @override
   void initState() {
@@ -494,6 +535,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       _requestPermissions();
       _loadFavorites();
       _loadPlaylists();
+      _loadCustomMetadata();
     });
   }
 
@@ -623,6 +665,44 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
   }
 
+  Future<void> _loadCustomMetadata() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String? encodedData = prefs.getString('custom_metadata');
+      if (encodedData != null) {
+        final Map<String, dynamic> decodedData = jsonDecode(encodedData);
+        setState(() {
+          _customMetadata.clear();
+          decodedData.forEach((key, value) {
+            _customMetadata[int.parse(key)] = Map<String, String>.from(value);
+          });
+        });
+      }
+    } catch (e) {
+      debugPrint("Error cargando custom metadata: $e");
+    }
+  }
+
+  Future<void> _saveCustomMetadata() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String encodedData = jsonEncode(
+        _customMetadata.map((key, value) => MapEntry(key.toString(), value)),
+      );
+      await prefs.setString('custom_metadata', encodedData);
+    } catch (e) {
+      debugPrint("Error guardando custom metadata: $e");
+    }
+  }
+
+  String _getSongTitle(SongModel song) {
+    return _customMetadata[song.id]?['title'] ?? song.title;
+  }
+
+  String _getSongArtist(SongModel song) {
+    return _customMetadata[song.id]?['artist'] ?? song.artist ?? "Desconocido";
+  }
+
   Future<void> _savePlaylists() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -660,8 +740,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           (s) => MediaItem(
             id: '${s.id}',
             album: s.album ?? "Desconocido",
-            title: s.title,
-            artist: s.artist ?? "Desconocido",
+            title: _getSongTitle(s),
+            artist: _getSongArtist(s),
             artUri: Uri.parse(
               'content://media/external/audio/media/${s.id}/albumart',
             ),
@@ -741,7 +821,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         child: Column(
           children: [
             _buildHeader(onRefresh: _refreshLibrary),
-            _buildSectionTitle('Tu Biblioteca', displaySongs.length),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: _buildSectionTitle('Tu Biblioteca', displaySongs.length),
+            ),
             _buildSearchBar(),
             const SizedBox(height: 20),
             Expanded(
@@ -823,7 +906,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         child: Column(
           children: [
             _buildHeader(),
-            _buildSectionTitle('Favoritos', favorites.length),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: _buildSectionTitle('Favoritos', favorites.length),
+            ),
             _buildSearchBar(),
             const SizedBox(height: 20),
             Expanded(
@@ -878,7 +964,6 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         child: Column(
           children: [
             _buildHeader(),
-            _buildPlaylistSearchBar(),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
               child: Row(
@@ -912,6 +997,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 ],
               ),
             ),
+            _buildPlaylistSearchBar(),
             Expanded(
               child: _playlists.isEmpty
                   ? Center(
@@ -1263,7 +1349,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          song.title,
+                          _getSongTitle(song),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -1275,7 +1361,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                           ),
                         ),
                         Text(
-                          song.artist ?? "Desconocido",
+                          _getSongArtist(song),
                           style: TextStyle(
                             color: colorScheme.onSurface.withValues(alpha: 0.5),
                             fontSize: 13,
@@ -1639,7 +1725,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   Text(
                     'Ajustes',
                     style: TextStyle(
-                      fontSize: 24,
+                      fontSize: 22,
                       fontWeight: FontWeight.bold,
                       color: Theme.of(context).colorScheme.onSurface,
                     ),
@@ -1661,43 +1747,22 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       activeThumbColor: const Color(0xFF4CAF50),
                     ),
                   ),
-                  _buildSettingTile(
-                    icon: Icons.notifications_rounded,
-                    title: 'Notificaciones',
-                    trailing: Switch(
-                      value: true,
-                      onChanged: (v) {},
-                      activeThumbColor: const Color(0xFF4CAF50),
-                    ),
-                  ),
-                  _buildSettingTile(
-                    icon: Icons.info_outline_rounded,
-                    title: 'Acerca de Lumina',
-                    onTap: () {
-                      showAboutDialog(
-                        context: context,
-                        applicationName: 'Lumina Player',
-                        applicationVersion: '1.0.0',
-                        applicationIcon: const Icon(
-                          Icons.music_note_rounded,
-                          color: Color(0xFF6C63FF),
-                        ),
-                      );
-                    },
-                  ),
                 ],
               ),
             ),
             Padding(
               padding: const EdgeInsets.only(bottom: 20),
               child: RichText(
-                text: const TextSpan(
+                text: TextSpan(
                   children: [
                     TextSpan(
                       text: 'Aplicación Creada por ',
-                      style: TextStyle(color: Colors.white, fontSize: 14),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurface,
+                        fontSize: 14,
+                      ),
                     ),
-                    TextSpan(
+                    const TextSpan(
                       text: 'Alvaro Jesus',
                       style: TextStyle(
                         color: Color(0xFF4CAF50),
@@ -1791,18 +1856,26 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     ),
                   ),
                   title: Text(
-                    song.title,
+                    _getSongTitle(song),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
                   subtitle: Text(
-                    song.artist ?? "Desconocido",
+                    _getSongArtist(song),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
                 const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.edit_rounded),
+                  title: const Text('Editar canción'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _showEditSongDialog(song);
+                  },
+                ),
                 ListTile(
                   leading: const Icon(Icons.playlist_add_rounded),
                   title: const Text('Agregar a lista de reproducción'),
@@ -1838,6 +1911,142 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           ),
         );
       },
+    );
+  }
+
+  void _updateAudioHandlerMetadata(SongModel song) {
+    (_audioHandler as MyAudioHandler).updateSongTag(
+      '${song.id}',
+      _getSongTitle(song),
+      _getSongArtist(song),
+    );
+  }
+
+  void _clearAudioHandlerMetadata(SongModel song) {
+    (_audioHandler as MyAudioHandler).clearSongTagOverride('${song.id}');
+  }
+
+  void _showEditSongDialog(SongModel song) {
+    final titleController = TextEditingController(text: _getSongTitle(song));
+    final artistController = TextEditingController(text: _getSongArtist(song));
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: isDark ? const Color(0xFF1A1A1A) : Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            const Icon(Icons.edit_rounded, color: Color(0xFF4CAF50), size: 22),
+            const SizedBox(width: 8),
+            const Text(
+              'Editar canción',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: titleController,
+              autofocus: true,
+              style: TextStyle(
+                color: isDark ? Colors.white : Colors.black87,
+              ),
+              decoration: InputDecoration(
+                labelText: 'Título',
+                labelStyle: const TextStyle(color: Color(0xFF4CAF50)),
+                prefixIcon: const Icon(Icons.music_note_rounded, color: Color(0xFF4CAF50)),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide(color: Colors.grey.withOpacity(0.4)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: const BorderSide(color: Color(0xFF4CAF50), width: 2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: artistController,
+              style: TextStyle(
+                color: isDark ? Colors.white : Colors.black87,
+              ),
+              decoration: InputDecoration(
+                labelText: 'Artista',
+                labelStyle: const TextStyle(color: Color(0xFF4CAF50)),
+                prefixIcon: const Icon(Icons.person_rounded, color: Color(0xFF4CAF50)),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide(color: Colors.grey.withOpacity(0.4)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: const BorderSide(color: Color(0xFF4CAF50), width: 2),
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context); // Cerrar primero para garantizar que se cierra
+              setState(() {
+                _customMetadata.remove(song.id);
+              });
+              _saveCustomMetadata();
+              _clearAudioHandlerMetadata(song);
+              ScaffoldMessenger.of(this.context).showSnackBar(
+                const SnackBar(
+                  content: Text('Canción restablecida al original'),
+                  backgroundColor: Color(0xFF4CAF50),
+                ),
+              );
+            },
+            child: const Text(
+              'RESTABLECER',
+              style: TextStyle(color: Colors.grey),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCELAR'),
+          ),
+          TextButton(
+            onPressed: () {
+              final newTitle = titleController.text.trim();
+              final newArtist = artistController.text.trim();
+              if (newTitle.isEmpty) return;
+              Navigator.pop(context); // Cerrar primero para garantizar que se cierra
+              setState(() {
+                _customMetadata[song.id] = {
+                  'title': newTitle,
+                  'artist': newArtist,
+                };
+              });
+              _saveCustomMetadata();
+              _updateAudioHandlerMetadata(song);
+              ScaffoldMessenger.of(this.context).showSnackBar(
+                const SnackBar(
+                  content: Text('Canción actualizada'),
+                  backgroundColor: Color(0xFF4CAF50),
+                ),
+              );
+            },
+            child: const Text(
+              'GUARDAR',
+              style: TextStyle(
+                color: Color(0xFF4CAF50),
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1938,8 +2147,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     final mediaItem = MediaItem(
       id: '${song.id}',
       album: song.album ?? "Desconocido",
-      title: song.title,
-      artist: song.artist ?? "Desconocido",
+      title: _getSongTitle(song),
+      artist: _getSongArtist(song),
       artUri: Uri.parse(
         'content://media/external/audio/media/${song.id}/albumart',
       ),
@@ -2041,7 +2250,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               ),
             ),
             title: Text(
-              song.title,
+              _getSongTitle(song),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -2052,7 +2261,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               ),
             ),
             subtitle: Text(
-              song.artist ?? "Desconocido",
+              _getSongArtist(song),
               maxLines: 1,
               style: TextStyle(
                 color: colorScheme.onSurface.withOpacity(0.6),
@@ -2240,30 +2449,25 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     ),
   );
 
-  Widget _buildSectionTitle(String title, int count) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 20),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(
-          title,
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-            color: Theme.of(context).colorScheme.onSurface,
-          ),
+  Widget _buildSectionTitle(String title, int count) => Row(
+    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    children: [
+      Text(
+        title,
+        style: TextStyle(
+          fontSize: 22,
+          fontWeight: FontWeight.bold,
+          color: Theme.of(context).colorScheme.onSurface,
         ),
-        Text(
-          '$count canciones',
-          style: TextStyle(
-            color: Theme.of(
-              context,
-            ).colorScheme.onSurface.withValues(alpha: 0.5),
-            fontSize: 12,
-          ),
+      ),
+      Text(
+        '$count canciones',
+        style: TextStyle(
+          color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+          fontSize: 12,
         ),
-      ],
-    ),
+      ),
+    ],
   );
 
   Widget _buildSearchBar() => Padding(
@@ -2467,16 +2671,22 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
               ),
               child: TextField(
                 onChanged: (value) => setState(() => _searchQuery = value),
-                style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
                 decoration: InputDecoration(
                   hintText: 'Buscar canción...',
                   hintStyle: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
                   border: InputBorder.none,
                   icon: Icon(
                     Icons.search,
-                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
                 ),
               ),
@@ -2508,13 +2718,27 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
             child: ListView.builder(
               padding: const EdgeInsets.symmetric(horizontal: 10),
               itemCount: widget.availableSongs
-                  .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
-                               (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                  .where(
+                    (s) =>
+                        s.title.toLowerCase().contains(
+                          _searchQuery.toLowerCase(),
+                        ) ||
+                        (s.artist ?? "").toLowerCase().contains(
+                          _searchQuery.toLowerCase(),
+                        ),
+                  )
                   .length,
               itemBuilder: (context, index) {
                 final filteredSongs = widget.availableSongs
-                    .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
-                                 (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                    .where(
+                      (s) =>
+                          s.title.toLowerCase().contains(
+                            _searchQuery.toLowerCase(),
+                          ) ||
+                          (s.artist ?? "").toLowerCase().contains(
+                            _searchQuery.toLowerCase(),
+                          ),
+                    )
                     .toList();
                 final song = filteredSongs[index];
                 final isSelected = _selectedSongs.any((s) => s.id == song.id);
@@ -2642,16 +2866,22 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
               ),
               child: TextField(
                 onChanged: (value) => setState(() => _searchQuery = value),
-                style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
                 decoration: InputDecoration(
                   hintText: 'Buscar canción...',
                   hintStyle: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
                   border: InputBorder.none,
                   icon: Icon(
                     Icons.search,
-                    color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
                 ),
               ),
@@ -2662,60 +2892,75 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
                 ? const Center(child: Text("No hay más canciones para añadir"))
                 : ListView.builder(
                     itemCount: _notAddedSongs
-                        .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
-                                     (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                        .where(
+                          (s) =>
+                              s.title.toLowerCase().contains(
+                                _searchQuery.toLowerCase(),
+                              ) ||
+                              (s.artist ?? "").toLowerCase().contains(
+                                _searchQuery.toLowerCase(),
+                              ),
+                        )
                         .length,
                     itemBuilder: (context, index) {
                       final filteredSongs = _notAddedSongs
-                          .where((s) => s.title.toLowerCase().contains(_searchQuery.toLowerCase()) || 
-                                       (s.artist ?? "").toLowerCase().contains(_searchQuery.toLowerCase()))
+                          .where(
+                            (s) =>
+                                s.title.toLowerCase().contains(
+                                  _searchQuery.toLowerCase(),
+                                ) ||
+                                (s.artist ?? "").toLowerCase().contains(
+                                  _searchQuery.toLowerCase(),
+                                ),
+                          )
                           .toList();
                       final song = filteredSongs[index];
-                final isSelected = _selectedToAdd.contains(song);
-                return CheckboxListTile(
-                  value: isSelected,
-                  activeColor: const Color(0xFF4CAF50),
-                  onChanged: (val) {
-                    setState(() {
-                      if (val == true) {
-                        _selectedToAdd.add(song);
-                      } else {
-                        _selectedToAdd.remove(song);
-                      }
-                    });
-                  },
-                  title: Text(
-                    song.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text(song.artist ?? "Desconocido"),
-                  secondary: ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: SizedBox(
-                      width: 50,
-                      height: 50,
-                      child: QueryArtworkWidget(
-                        id: song.id,
-                        type: ArtworkType.AUDIO,
-                        format: ArtworkFormat.JPEG,
-                        size: 2000,
-                        artworkWidth: 50,
-                        artworkHeight: 50,
-                        artworkBorder: BorderRadius.zero,
-                        artworkFit: BoxFit.cover,
-                        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                          context: context,
-                          id: song.id,
-                          width: 50,
-                          height: 50,
+                      final isSelected = _selectedToAdd.contains(song);
+                      return CheckboxListTile(
+                        value: isSelected,
+                        activeColor: const Color(0xFF4CAF50),
+                        onChanged: (val) {
+                          setState(() {
+                            if (val == true) {
+                              _selectedToAdd.add(song);
+                            } else {
+                              _selectedToAdd.remove(song);
+                            }
+                          });
+                        },
+                        title: Text(
+                          song.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                      ),
-                    ),
+                        subtitle: Text(song.artist ?? "Desconocido"),
+                        secondary: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: SizedBox(
+                            width: 50,
+                            height: 50,
+                            child: QueryArtworkWidget(
+                              id: song.id,
+                              type: ArtworkType.AUDIO,
+                              format: ArtworkFormat.JPEG,
+                              size: 2000,
+                              artworkWidth: 50,
+                              artworkHeight: 50,
+                              artworkBorder: BorderRadius.zero,
+                              artworkFit: BoxFit.cover,
+                              nullArtworkWidget:
+                                  AppHelpers.getRandomDefaultCover(
+                                    context: context,
+                                    id: song.id,
+                                    width: 50,
+                                    height: 50,
+                                  ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
                   ),
-                    );
-                  },
-                ),
           ),
         ],
       ),
