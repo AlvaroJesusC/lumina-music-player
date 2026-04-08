@@ -2077,7 +2077,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         borderRadius: BorderRadius.circular(15),
       ),
       child: ListTile(
-        leading: Icon(icon, color: const Color(0xFF6C63FF)),
+        leading: Icon(icon, color: const Color(0xFF4CAF50)),
         title: Text(
           title,
           style: TextStyle(
