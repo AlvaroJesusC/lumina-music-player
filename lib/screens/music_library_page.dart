@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:audio_service/audio_service.dart';
@@ -9,12 +8,82 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image_picker/image_picker.dart';
 import '../models/playlist_model.dart';
-import '../core/app_helpers.dart';
+import '../services/appearance_settings.dart';
 import '../services/audio_handler.dart';
 import '../services/audio_service_instance.dart';
+import '../theme/lumina_colors.dart';
+import '../theme/lumina_haptics.dart';
+import '../theme/lumina_shapes.dart';
 import 'create_playlist_screen.dart';
 import 'add_songs_screen.dart';
 import 'full_player_screen.dart';
+import '../widgets/queue_bottom_sheet.dart';
+import '../widgets/cached_artwork.dart';
+import '../widgets/lumina_mini_player.dart';
+
+
+/// Widget que mantiene el estado de cada pestaña mientras proporciona
+/// una transición de desvanecimiento suave y fluida al cambiar de pestaña.
+class FadeIndexedStack extends StatefulWidget {
+  final int index;
+  final List<Widget> children;
+  final Duration duration;
+
+  const FadeIndexedStack({
+    super.key,
+    required this.index,
+    required this.children,
+    this.duration = const Duration(milliseconds: 220),
+  });
+
+  @override
+  State<FadeIndexedStack> createState() => _FadeIndexedStackState();
+}
+
+class _FadeIndexedStackState extends State<FadeIndexedStack>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _animation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: widget.duration,
+    );
+    _animation = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+    );
+    _controller.value = 1.0;
+  }
+
+  @override
+  void didUpdateWidget(FadeIndexedStack oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.index != oldWidget.index) {
+      _controller.forward(from: 0.0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _animation,
+      child: IndexedStack(
+        index: widget.index,
+        children: widget.children,
+      ),
+    );
+  }
+}
 
 /// Página principal de la app. Contiene la biblioteca, favoritos,
 /// listas de reproducción y ajustes.
@@ -307,7 +376,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     bottom: 0,
                     left: 0,
                     right: 0,
-                    child: _buildMiniPlayer(snapshot.data!),
+                    child: LuminaMiniPlayer(
+                      item: snapshot.data!,
+                      audioHandler: audioHandler,
+                      onTap: _showFullPlayer,
+                    ),
                   );
                 }
                 return const SizedBox.shrink();
@@ -321,14 +394,45 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Widget _buildMainContent() {
-    if (_selectedIndex == 3) return _buildSettingsContent();
-    if (_selectedIndex == 2) {
-      return _selectedPlaylist != null
-          ? _buildPlaylistDetailView(_selectedPlaylist!)
-          : _buildPlaylistsContent();
-    }
-    if (_selectedIndex == 1) return _buildFavoritesContent();
+    return FadeIndexedStack(
+      index: _selectedIndex,
+      children: [
+        _buildLibraryContent(),
+        _buildFavoritesContent(),
+        _buildPlaylistsTabContent(),
+        _buildSettingsContent(),
+      ],
+    );
+  }
 
+  Widget _buildPlaylistsTabContent() {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 280),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) {
+        final slide = Tween<Offset>(
+          begin: const Offset(0.08, 0.0),
+          end: Offset.zero,
+        ).animate(animation);
+        return SlideTransition(
+          position: slide,
+          child: FadeTransition(opacity: animation, child: child),
+        );
+      },
+      child: _selectedPlaylist != null
+          ? KeyedSubtree(
+              key: ValueKey('playlist_${_selectedPlaylist!.id}'),
+              child: _buildPlaylistDetailView(_selectedPlaylist!),
+            )
+          : KeyedSubtree(
+              key: const ValueKey('playlists_list'),
+              child: _buildPlaylistsContent(),
+            ),
+    );
+  }
+
+  Widget _buildLibraryContent() {
     final displaySongs = _filteredSongs;
     return Container(
       decoration: _buildBackgroundDecoration(),
@@ -348,6 +452,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     ? const Center(child: CircularProgressIndicator())
                     : displaySongs.isEmpty
                     ? ListView(
+                        key: const PageStorageKey('library_empty'),
                         children: [
                           SizedBox(
                             height: MediaQuery.of(context).size.height * 0.2,
@@ -371,21 +476,32 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                             ),
                           ),
                         ],
-                      )
-                    : ListView.builder(
-                        padding: const EdgeInsets.symmetric(horizontal: 20),
-                        itemCount: displaySongs.length,
-                        itemBuilder: (context, index) =>
-                            _buildMusicCard(displaySongs[index]),
+                    )
+                    : StreamBuilder<MediaItem?>(
+                        stream: audioHandler.mediaItem,
+                        builder: (context, mediaSnapshot) {
+                          final playingId = mediaSnapshot.data?.id;
+                          return ListView.builder(
+                            key: const PageStorageKey('library_list'),
+                            itemExtent: 82.0,
+                            cacheExtent: 250,
+                            padding: const EdgeInsets.only(
+                              left: 20,
+                              right: 20,
+                              bottom: 95,
+                            ),
+                            itemCount: displaySongs.length,
+                            itemBuilder: (context, index) {
+                              final song = displaySongs[index];
+                              return _buildMusicCard(
+                                song,
+                                isSelected: playingId == '${song.id}',
+                              );
+                            },
+                          );
+                        },
                       ),
               ),
-            ),
-            StreamBuilder<MediaItem?>(
-              stream: audioHandler.mediaItem,
-              builder: (context, snapshot) {
-                if (snapshot.hasData) return const SizedBox(height: 85);
-                return const SizedBox.shrink();
-              },
             ),
           ],
         ),
@@ -394,19 +510,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   BoxDecoration _buildBackgroundDecoration() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
     return BoxDecoration(
-      gradient: LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: isDark
-            ? [
-                const Color(0xFF0A0A0A),
-                const Color(0xFF1A1A1A),
-                const Color(0xFF0A0A0A),
-              ]
-            : [Colors.white, Colors.grey[100]!, Colors.white],
-      ),
+      color: LuminaColors.of(context).background,
     );
   }
 
@@ -442,19 +547,30 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                         ],
                       ),
                     )
-                  : ListView.builder(
-                      padding: const EdgeInsets.symmetric(horizontal: 20),
-                      itemCount: favorites.length,
-                      itemBuilder: (context, index) =>
-                          _buildMusicCard(favorites[index]),
+                  : StreamBuilder<MediaItem?>(
+                      stream: audioHandler.mediaItem,
+                      builder: (context, mediaSnapshot) {
+                        final playingId = mediaSnapshot.data?.id;
+                        return ListView.builder(
+                          key: const PageStorageKey('favorites_list'),
+                          itemExtent: 82.0,
+                          cacheExtent: 250,
+                          padding: const EdgeInsets.only(
+                            left: 20,
+                            right: 20,
+                            bottom: 95,
+                          ),
+                          itemCount: favorites.length,
+                          itemBuilder: (context, index) {
+                            final song = favorites[index];
+                            return _buildMusicCard(
+                              song,
+                              isSelected: playingId == '${song.id}',
+                            );
+                          },
+                        );
+                      },
                     ),
-            ),
-            StreamBuilder<MediaItem?>(
-              stream: audioHandler.mediaItem,
-              builder: (context, snapshot) {
-                if (snapshot.hasData) return const SizedBox(height: 85);
-                return const SizedBox.shrink();
-              },
             ),
           ],
         ),
@@ -494,7 +610,12 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       ),
                     )
                   : GridView.builder(
-                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      key: const PageStorageKey('playlists_grid'),
+                      padding: const EdgeInsets.only(
+                        left: 20,
+                        right: 20,
+                        bottom: 95,
+                      ),
                       gridDelegate:
                           const SliverGridDelegateWithFixedCrossAxisCount(
                             crossAxisCount: 2,
@@ -506,13 +627,6 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       itemBuilder: (context, index) =>
                           _buildPlaylistGridCard(filteredPlaylists[index]),
                     ),
-            ),
-            StreamBuilder<MediaItem?>(
-              stream: audioHandler.mediaItem,
-              builder: (context, snapshot) {
-                if (snapshot.hasData) return const SizedBox(height: 85);
-                return const SizedBox.shrink();
-              },
             ),
           ],
         ),
@@ -655,18 +769,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
 
     if (playlist.songs.length == 1 ||
         playlist.name.toLowerCase().contains("favoritos")) {
-      return ClipRRect(
-        borderRadius: borderRadius,
-        child: QueryArtworkWidget(
-          id: playlist.songs[0].id,
-          type: ArtworkType.AUDIO,
-          size: 500,
-          artworkFit: BoxFit.cover,
-          nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-            context: context,
-            id: playlist.songs[0].id,
-          ),
-        ),
+      return CachedArtwork(
+        songId: playlist.songs[0].id,
+        borderRadius: 24,
+        size: 250,
       );
     }
 
@@ -706,26 +812,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   ),
                 );
               }
-              return Container(
-                decoration: BoxDecoration(
-                  color: const Color(0xFF252A34),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
-                  child: QueryArtworkWidget(
-                    id: playlist.songs[i].id,
-                    type: ArtworkType.AUDIO,
-                    format: ArtworkFormat.JPEG,
-                    size: 2000,
-                    artworkBorder: BorderRadius.zero,
-                    artworkFit: BoxFit.cover,
-                    nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                      context: context,
-                      id: playlist.songs[i].id,
-                    ),
-                  ),
-                ),
+              return CachedArtwork(
+                songId: playlist.songs[i].id,
+                borderRadius: 10,
+                size: 150,
               );
             }
             return Container(
@@ -767,17 +857,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         crossAxisCount: 2,
       ),
       itemCount: min(playlist.songs.length, 4),
-      itemBuilder: (context, i) => QueryArtworkWidget(
-        id: playlist.songs[i].id,
-        type: ArtworkType.AUDIO,
-        format: ArtworkFormat.JPEG,
-        size: 2000,
-        artworkBorder: BorderRadius.zero,
-        artworkFit: BoxFit.cover,
-        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-          context: context,
-          id: playlist.songs[i].id,
-        ),
+      itemBuilder: (context, i) => CachedArtwork(
+        songId: playlist.songs[i].id,
+        borderRadius: 0,
+        size: 150,
       ),
     );
   }
@@ -804,100 +887,95 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  Widget _buildSongListItem(SongModel song, List<SongModel> list) {
+  Widget _buildSongListItem(
+    SongModel song,
+    List<SongModel> list, {
+    bool isSelected = false,
+  }) {
     final colorScheme = Theme.of(context).colorScheme;
     final isFavorite = _favoriteIds.contains(song.id);
 
-    return StreamBuilder<MediaItem?>(
-      stream: audioHandler.mediaItem,
-      builder: (context, snapshot) {
-        final isSelected = snapshot.data?.id == '${song.id}';
-        return Container(
-          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? const Color(0xFF4CAF50).withValues(alpha: 0.15)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            child: Row(
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: QueryArtworkWidget(
-                    id: song.id,
-                    type: ArtworkType.AUDIO,
-                    artworkWidth: 55,
-                    artworkHeight: 55,
-                    artworkFit: BoxFit.cover,
-                    nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                      context: context,
-                      id: song.id,
-                      width: 55,
-                      height: 55,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 15),
-                Expanded(
-                  child: InkWell(
-                    onTap: () => _playSong(song, fromList: list),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _getSongTitle(song),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                            color: isSelected
-                                ? const Color(0xFF4CAF50)
-                                : colorScheme.onSurface,
-                          ),
-                        ),
-                        Text(
-                          _getSongArtist(song),
-                          style: TextStyle(
-                            color: colorScheme.onSurface.withValues(alpha: 0.5),
-                            fontSize: 13,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
+    return Container(
+      height: 72,
+      margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
+      decoration: BoxDecoration(
+        color: isSelected
+            ? const Color(0xFF4CAF50).withValues(alpha: 0.15)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Row(
+          children: [
+            CachedArtwork(
+              songId: song.id,
+              width: 55,
+              height: 55,
+              borderRadius: 12,
+              size: 150,
+            ),
+            const SizedBox(width: 15),
+            Expanded(
+              child: InkWell(
+                onTap: () => _playSong(song, fromList: list),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    IconButton(
-                      icon: Icon(
-                        isFavorite ? Icons.favorite : Icons.favorite_border,
-                        color: isFavorite
+                    Text(
+                      _getSongTitle(song),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                        color: isSelected
                             ? const Color(0xFF4CAF50)
-                            : colorScheme.onSurface.withValues(alpha: 0.5),
+                            : colorScheme.onSurface,
                       ),
-                      onPressed: () => _toggleFavorite(song.id),
                     ),
-                    IconButton(
-                      icon: Icon(
-                        Icons.more_vert_rounded,
-                        color: colorScheme.onSurface.withValues(alpha: 0.5),
+                    const SizedBox(height: 2),
+                    Text(
+                      _getSongArtist(song),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: colorScheme.onSurface.withValues(alpha: 0.6),
+                        fontSize: 13,
                       ),
-                      onPressed: () => _showSongOptions(context, song),
                     ),
                   ],
                 ),
+              ),
+            ),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: Icon(
+                    isFavorite ? Icons.favorite : Icons.favorite_border,
+                    color: isFavorite
+                        ? const Color(0xFF4CAF50)
+                        : colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                  onPressed: () => _toggleFavorite(song.id),
+                ),
+                IconButton(
+                  icon: Icon(
+                    Icons.more_vert_rounded,
+                    color: colorScheme.onSurface.withValues(alpha: 0.5),
+                  ),
+                  onPressed: () => _showSongOptions(context, song),
+                ),
               ],
             ),
-          ),
-        );
-      },
+          ],
+        ),
+      ),
     );
   }
+
 
   Widget _buildPlaylistDetailView(PlaylistModelCustom playlist) {
     final colorScheme = Theme.of(context).colorScheme;
@@ -915,26 +993,23 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             height: 400,
             child: Opacity(opacity: 0.7, child: _buildHeaderCollage(playlist)),
           ),
-          Positioned.fill(
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
-              child: Container(color: Colors.transparent),
-            ),
-          ),
-          Positioned.fill(
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            height: 400,
             child: Container(
               decoration: BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: [
-                    Colors.transparent,
                     isDark
-                        ? const Color(0xFF0A0A0A).withValues(alpha: 0.4)
-                        : Colors.white.withValues(alpha: 0.4),
+                        ? const Color(0xFF0A0A0A).withValues(alpha: 0.6)
+                        : Colors.white.withValues(alpha: 0.6),
                     isDark ? const Color(0xFF0A0A0A) : Colors.white,
                   ],
-                  stops: const [0.0, 0.5, 0.85],
+                  stops: const [0.0, 0.9],
                 ),
               ),
             ),
@@ -1084,11 +1159,22 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   ),
                 ),
               ),
-              SliverList(
-                delegate: SliverChildBuilderDelegate((context, index) {
-                  final song = playlist.songs[index];
-                  return _buildSongListItem(song, playlist.songs);
-                }, childCount: playlist.songs.length),
+              StreamBuilder<MediaItem?>(
+                stream: audioHandler.mediaItem,
+                builder: (context, mediaSnapshot) {
+                  final playingId = mediaSnapshot.data?.id;
+                  return SliverFixedExtentList(
+                    itemExtent: 80.0,
+                    delegate: SliverChildBuilderDelegate((context, index) {
+                      final song = playlist.songs[index];
+                      return _buildSongListItem(
+                        song,
+                        playlist.songs,
+                        isSelected: playingId == '${song.id}',
+                      );
+                    }, childCount: playlist.songs.length),
+                  );
+                },
               ),
               const SliverToBoxAdapter(child: SizedBox(height: 120)),
             ],
@@ -1170,28 +1256,12 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
 
     Widget cell(int i) {
       if (i < playlist.songs.length) {
-        return ClipRRect(
-          borderRadius: BorderRadius.circular(4),
-          child: SizedBox(
-            width: cellSize,
-            height: cellSize,
-            child: QueryArtworkWidget(
-              id: playlist.songs[i].id,
-              type: ArtworkType.AUDIO,
-              format: ArtworkFormat.JPEG,
-              size: 200,
-              artworkWidth: cellSize,
-              artworkHeight: cellSize,
-              artworkBorder: BorderRadius.zero,
-              artworkFit: BoxFit.cover,
-              nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                context: context,
-                id: playlist.songs[i].id,
-                width: cellSize,
-                height: cellSize,
-              ),
-            ),
-          ),
+        return CachedArtwork(
+          songId: playlist.songs[i].id,
+          width: cellSize,
+          height: cellSize,
+          borderRadius: 4,
+          size: 100,
         );
       }
       return Container(
@@ -1238,8 +1308,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(20),
             ),
-            title: Row(
-              children: const [
+            title: const Row(
+              children: [
                 Icon(Icons.edit_rounded, color: Color(0xFF4CAF50), size: 22),
                 SizedBox(width: 8),
                 Text(
@@ -1534,9 +1604,48 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     title: 'Modo Oscuro',
                     trailing: Switch(
                       value: Theme.of(context).brightness == Brightness.dark,
-                      onChanged: (value) => widget.onThemeChanged(value),
-                      activeThumbColor: const Color(0xFF4CAF50),
+                      onChanged: (value) {
+                        LuminaHaptics.fire(context, HapticEvent.select);
+                        widget.onThemeChanged(value);
+                      },
+                      activeThumbColor: LuminaColors.of(context).accent,
                     ),
+                  ),
+                  ValueListenableBuilder<PlayerBackgroundStyle>(
+                    valueListenable: AppearanceSettings.instance.backgroundStyle,
+                    builder: (context, style, _) {
+                      return _buildSettingTile(
+                        icon: Icons.palette_outlined,
+                        title: 'Fondo del Reproductor',
+                        subtitle: '${style.label} — ${style.description}',
+                        trailing: Icon(
+                          Icons.chevron_right_rounded,
+                          color: LuminaColors.of(context).textTertiary,
+                        ),
+                        onTap: () => _showBackgroundStylePicker(context),
+                      );
+                    },
+                  ),
+                  ValueListenableBuilder<bool>(
+                    valueListenable: AppearanceSettings.instance.hapticsEnabled,
+                    builder: (context, enabled, _) {
+                      return _buildSettingTile(
+                        icon: Icons.vibration_rounded,
+                        title: 'Respuesta Háptica',
+                        subtitle: 'Vibración táctil en botones y controles',
+                        trailing: Switch(
+                          value: enabled,
+                          onChanged: (val) async {
+                            await AppearanceSettings.instance
+                                .setHapticsEnabled(enabled: val);
+                            if (val && context.mounted) {
+                              LuminaHaptics.fire(context, HapticEvent.select);
+                            }
+                          },
+                          activeThumbColor: LuminaColors.of(context).accent,
+                        ),
+                      );
+                    },
                   ),
                 ],
               ),
@@ -1578,29 +1687,139 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
+  void _showBackgroundStylePicker(BuildContext context) {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: colors.surfaceElevated,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(shapes.sheet)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: colors.hairline,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  'Fondo del Reproductor',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: colors.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                ...PlayerBackgroundStyle.values.map((style) {
+                  final isSelected =
+                      AppearanceSettings.instance.backgroundStyle.value == style;
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    decoration: BoxDecoration(
+                      color: isSelected ? colors.accentSoft : colors.surface,
+                      borderRadius: BorderRadius.circular(shapes.card),
+                      border: Border.all(
+                        color: isSelected ? colors.accent : colors.hairline,
+                        width: 1,
+                      ),
+                    ),
+                    child: ListTile(
+                      title: Text(
+                        style.label,
+                        style: TextStyle(
+                          color: isSelected ? colors.accentInk : colors.textPrimary,
+                          fontWeight:
+                              isSelected ? FontWeight.w700 : FontWeight.w500,
+                        ),
+                      ),
+                      subtitle: Text(
+                        style.description,
+                        style: TextStyle(
+                          color: colors.textSecondary,
+                          fontSize: 12,
+                        ),
+                      ),
+                      trailing: isSelected
+                          ? Icon(Icons.check_circle_rounded, color: colors.accent)
+                          : null,
+                      onTap: () async {
+                        LuminaHaptics.fire(context, HapticEvent.select);
+                        await AppearanceSettings.instance
+                            .setBackgroundStyle(style);
+                        if (context.mounted) {
+                          Navigator.pop(context);
+                          setState(() {});
+                        }
+                      },
+                    ),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildSettingTile({
     required IconData icon,
     required String title,
+    String? subtitle,
     Widget? trailing,
     VoidCallback? onTap,
   }) {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(15),
+        color: colors.surface,
+        borderRadius: BorderRadius.circular(shapes.card),
+        border: Border.all(color: colors.hairline, width: 1),
       ),
       child: ListTile(
-        leading: Icon(icon, color: const Color(0xFF4CAF50)),
+        leading: Icon(icon, color: colors.accent),
         title: Text(
           title,
           style: TextStyle(
-            fontWeight: FontWeight.w500,
-            color: Theme.of(context).colorScheme.onSurface,
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+            color: colors.textPrimary,
           ),
         ),
+        subtitle: subtitle != null
+            ? Text(
+                subtitle,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: colors.textSecondary,
+                ),
+              )
+            : null,
         trailing: trailing,
-        onTap: onTap,
+        onTap: onTap != null
+            ? () {
+                LuminaHaptics.fire(context, HapticEvent.select);
+                onTap();
+              }
+            : null,
       ),
     );
   }
@@ -1625,26 +1844,18 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   width: 40,
                   height: 5,
                   decoration: BoxDecoration(
-                    color: Colors.grey.withOpacity(0.3),
+                    color: Colors.grey.withValues(alpha: 0.3),
                     borderRadius: BorderRadius.circular(10),
                   ),
                 ),
                 const SizedBox(height: 15),
                 ListTile(
-                  leading: ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: QueryArtworkWidget(
-                      id: song.id,
-                      type: ArtworkType.AUDIO,
-                      artworkWidth: 40,
-                      artworkHeight: 40,
-                      nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                        context: context,
-                        id: song.id,
-                        width: 40,
-                        height: 40,
-                      ),
-                    ),
+                  leading: CachedArtwork(
+                    songId: song.id,
+                    width: 40,
+                    height: 40,
+                    borderRadius: 8,
+                    size: 150,
                   ),
                   title: Text(
                     _getSongTitle(song),
@@ -1681,6 +1892,14 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   onTap: () {
                     Navigator.pop(context);
                     _addToQueue(song);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.format_list_bulleted_rounded),
+                  title: const Text('Ver fila de reproducción'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    QueueBottomSheet.show(context, audioHandler);
                   },
                 ),
                 ListTile(
@@ -1727,11 +1946,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       builder: (context) => AlertDialog(
         backgroundColor: isDark ? const Color(0xFF1A1A1A) : Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Row(
+        title: const Row(
           children: [
-            const Icon(Icons.edit_rounded, color: Color(0xFF4CAF50), size: 22),
-            const SizedBox(width: 8),
-            const Text(
+            Icon(Icons.edit_rounded, color: Color(0xFF4CAF50), size: 22),
+            SizedBox(width: 8),
+            Text(
               'Editar canción',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
             ),
@@ -1752,7 +1971,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 prefixIcon: const Icon(Icons.music_note_rounded, color: Color(0xFF4CAF50)),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.withOpacity(0.4)),
+                  borderSide: BorderSide(color: Colors.grey.withValues(alpha: 0.4)),
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
@@ -1772,7 +1991,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 prefixIcon: const Icon(Icons.person_rounded, color: Color(0xFF4CAF50)),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(color: Colors.grey.withOpacity(0.4)),
+                  borderSide: BorderSide(color: Colors.grey.withValues(alpha: 0.4)),
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
@@ -1925,6 +2144,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         _playlists.add(result);
       });
       _savePlaylists();
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Lista creada y canción agregada'),
@@ -1934,29 +2154,62 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
   }
 
-  void _addToQueue(SongModel song) {
-    final mediaItem = MediaItem(
-      id: '${song.id}',
-      album: song.album ?? "Desconocido",
-      title: _getSongTitle(song),
-      artist: _getSongArtist(song),
-      artUri: Uri.parse(
-        'content://media/external/audio/media/${song.id}/albumart',
-      ),
-      duration: Duration(milliseconds: song.duration ?? 0),
-      extras: {'url': song.data},
-    );
-    audioHandler.addQueueItem(mediaItem);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Añadida a la cola de reproducción',
-          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black),
+  Future<void> _addToQueue(SongModel song) async {
+    try {
+      final mediaItem = MediaItem(
+        id: '${song.id}',
+        album: song.album ?? "Desconocido",
+        title: _getSongTitle(song),
+        artist: _getSongArtist(song),
+        artUri: Uri.parse(
+          'content://media/external/audio/media/${song.id}/albumart',
         ),
-        backgroundColor: Color.fromARGB(255, 255, 255, 255),
-      ),
-    );
+        duration: Duration(milliseconds: song.duration ?? 0),
+        extras: {'url': song.data},
+      );
+      await audioHandler.addQueueItem(mediaItem);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          backgroundColor: Theme.of(context).brightness == Brightness.dark
+              ? const Color(0xFF222222)
+              : const Color(0xFF333333),
+          content: Row(
+            children: [
+              const Icon(Icons.queue_music_rounded, color: Color(0xFF4CAF50)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  '${_getSongTitle(song)} añadida a la cola',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('No se pudo añadir a la cola: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
   }
+
 
   void _deleteSong(SongModel song) {
     showDialog(
@@ -1996,192 +2249,99 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  Widget _buildMusicCard(SongModel song) {
-    bool isSelected = false;
-    final colorScheme = Theme.of(context).colorScheme;
+  Widget _buildMusicCard(SongModel song, {bool isSelected = false}) {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+    final isFav = _favoriteIds.contains(song.id);
 
-    return StreamBuilder<MediaItem?>(
-      stream: audioHandler.mediaItem,
-      builder: (context, snapshot) {
-        isSelected = snapshot.data?.id == '${song.id}';
-        return Container(
-          margin: const EdgeInsets.only(bottom: 12),
-          decoration: BoxDecoration(
-            color: isSelected
-                ? const Color(0xFF4CAF50).withOpacity(0.15)
-                : colorScheme.surface,
-            borderRadius: BorderRadius.circular(15),
-          ),
-          child: ListTile(
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 15,
-              vertical: 5,
-            ),
-            leading: ClipRRect(
-              borderRadius: BorderRadius.circular(10),
-              child: SizedBox(
-                width: 50,
-                height: 50,
-                child: QueryArtworkWidget(
-                  id: song.id,
-                  type: ArtworkType.AUDIO,
-                  format: ArtworkFormat.JPEG,
-                  size: 2000,
-                  artworkWidth: 50,
-                  artworkHeight: 50,
-                  artworkBorder: BorderRadius.zero,
-                  artworkFit: BoxFit.cover,
-                  nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                    context: context,
-                    id: song.id,
-                    width: 50,
-                    height: 50,
-                  ),
+    return Container(
+      height: 72,
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        color: isSelected ? colors.accentSoft : colors.surface,
+        borderRadius: BorderRadius.circular(shapes.card),
+        border: Border.all(
+          color: isSelected
+              ? colors.accent.withValues(alpha: 0.35)
+              : colors.hairline,
+          width: 1,
+        ),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 4,
+        ),
+        leading: CachedArtwork(
+          songId: song.id,
+          width: 50,
+          height: 50,
+          borderRadius: shapes.artworkSmall,
+          size: 150,
+        ),
+        title: Row(
+          children: [
+            if (isSelected) ...[
+              Icon(
+                Icons.graphic_eq_rounded,
+                size: 18,
+                color: colors.accentInk,
+              ),
+              const SizedBox(width: 6),
+            ],
+            Expanded(
+              child: Text(
+                _getSongTitle(song),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: isSelected ? colors.accentInk : colors.textPrimary,
+                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+                  fontSize: 15,
                 ),
               ),
-            ),
-            title: Text(
-              _getSongTitle(song),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: isSelected
-                    ? const Color(0xFF4CAF50)
-                    : colorScheme.onSurface,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              ),
-            ),
-            subtitle: Text(
-              _getSongArtist(song),
-              maxLines: 1,
-              style: TextStyle(
-                color: colorScheme.onSurface.withOpacity(0.6),
-                fontSize: 13,
-              ),
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  icon: Icon(
-                    _favoriteIds.contains(song.id)
-                        ? Icons.favorite
-                        : Icons.favorite_border,
-                    color: _favoriteIds.contains(song.id)
-                        ? const Color(0xFF4CAF50)
-                        : colorScheme.onSurface.withOpacity(0.5),
-                    size: 20,
-                  ),
-                  onPressed: () => _toggleFavorite(song.id),
-                ),
-                IconButton(
-                  icon: Icon(
-                    Icons.more_vert_rounded,
-                    color: colorScheme.onSurface.withOpacity(0.5),
-                    size: 20,
-                  ),
-                  onPressed: () => _showSongOptions(context, song),
-                ),
-              ],
-            ),
-            onTap: () => _playSong(song),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildMiniPlayer(MediaItem item) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    return GestureDetector(
-      onTap: () => _showFullPlayer(),
-      child: Container(
-        height: 75,
-        margin: const EdgeInsets.all(10),
-        padding: const EdgeInsets.symmetric(horizontal: 15),
-        decoration: BoxDecoration(
-          color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-          borderRadius: BorderRadius.circular(25),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: isDark ? 0.5 : 0.1),
-              blurRadius: 10,
-              offset: const Offset(0, 5),
             ),
           ],
         ),
-        child: Row(
+        subtitle: Text(
+          _getSongArtist(song),
+          maxLines: 1,
+          style: TextStyle(
+            color: isSelected
+                ? colors.accentInk.withValues(alpha: 0.8)
+                : colors.textSecondary,
+            fontSize: 13,
+            fontWeight: FontWeight.w400,
+          ),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(10),
-              child: QueryArtworkWidget(
-                id: int.parse(item.id),
-                type: ArtworkType.AUDIO,
-                artworkWidth: 55,
-                artworkHeight: 55,
-                size: 300,
-                artworkFit: BoxFit.cover,
-                nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                  context: context,
-                  id: int.parse(item.id),
-                  width: 55,
-                  height: 55,
-                ),
+            IconButton(
+              icon: Icon(
+                isFav ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+                color: isFav ? colors.accent : colors.textTertiary,
+                size: 20,
               ),
-            ),
-            const SizedBox(width: 15),
-            Expanded(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    item.title,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Theme.of(context).colorScheme.onSurface,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Text(
-                    item.artist ?? "Desconocido",
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.onSurface.withValues(alpha: 0.6),
-                    ),
-                  ),
-                ],
-              ),
+              onPressed: () {
+                LuminaHaptics.fire(context, HapticEvent.select);
+                _toggleFavorite(song.id);
+              },
             ),
             IconButton(
               icon: Icon(
-                Icons.skip_next_rounded,
-                color: Theme.of(context).colorScheme.onSurface,
+                Icons.more_vert_rounded,
+                color: colors.textTertiary,
+                size: 20,
               ),
-              onPressed: () => audioHandler.skipToNext(),
-            ),
-            StreamBuilder<PlaybackState>(
-              stream: audioHandler.playbackState,
-              builder: (context, snapshot) {
-                final playing = snapshot.data?.playing ?? false;
-                return IconButton(
-                  icon: Icon(
-                    playing
-                        ? Icons.pause_circle_filled_rounded
-                        : Icons.play_circle_filled_rounded,
-                    size: 40,
-                    color: const Color(0xFF4CAF50),
-                  ),
-                  onPressed: () =>
-                      playing ? audioHandler.pause() : audioHandler.play(),
-                );
-              },
+              onPressed: () => _showSongOptions(context, song),
             ),
           ],
         ),
+        onTap: () {
+          LuminaHaptics.fire(context, HapticEvent.select);
+          _playSong(song);
+        },
       ),
     );
   }
@@ -2190,6 +2350,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      useSafeArea: true,
       backgroundColor: Colors.transparent,
       builder: (context) => FullPlayerScreen(
         audioHandler: audioHandler,
@@ -2199,152 +2360,210 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  Widget _buildHeader({VoidCallback? onRefresh}) => Padding(
-    padding: const EdgeInsets.all(20.0),
-    child: Row(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(6),
-          decoration: BoxDecoration(
-            color: const Color(0xFF4CAF50),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: const Icon(
-            Icons.music_note_rounded,
-            color: Colors.black,
-            size: 24,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Text(
-          'Lumina',
-          style: TextStyle(
-            fontSize: 26,
-            fontWeight: FontWeight.bold,
-            color: Theme.of(context).colorScheme.onSurface,
-          ),
-        ),
-        const Spacer(),
-        if (onRefresh != null)
-          IconButton(
-            onPressed: onRefresh,
-            icon: Icon(
-              Icons.refresh_rounded,
-              color: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.6),
-            ),
-            tooltip: 'Actualizar biblioteca',
-          ),
-      ],
-    ),
-  );
-
-  Widget _buildSectionTitle(String title, int count) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(
-          title,
-          style: TextStyle(
-            fontSize: 22,
-            fontWeight: FontWeight.bold,
-            color: Theme.of(context).colorScheme.onSurface,
-          ),
-        ),
-        Text(
-          '$count canciones',
-          style: TextStyle(
-            color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
-            fontSize: 12,
-          ),
-        ),
-      ],
-    ),
-  );
-
-  Widget _buildPlaylistsHeader(bool isDark) => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(
-          'Mis Listas',
-          style: TextStyle(
-            fontSize: 22,
-            fontWeight: FontWeight.bold,
-            color: Theme.of(context).colorScheme.onSurface,
-          ),
-        ),
-        GestureDetector(
-          onTap: () => _openCreatePlaylist(),
-          child: Container(
-            padding: const EdgeInsets.all(8),
+  Widget _buildHeader({VoidCallback? onRefresh}) {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(7),
             decoration: BoxDecoration(
-              color: isDark
-                  ? const Color(0xFF1E1E1E)
-                  : Colors.grey[200],
-              shape: BoxShape.circle,
+              color: colors.accent,
+              borderRadius: BorderRadius.circular(shapes.artworkSmall),
+              boxShadow: [
+                BoxShadow(
+                  color: colors.accentGlow,
+                  blurRadius: 12,
+                  offset: const Offset(0, 4),
+                ),
+              ],
             ),
-            child: const Icon(
-              Icons.add,
-              color: Color(0xFF4CAF50),
-              size: 24,
+            child: Icon(
+              Icons.music_note_rounded,
+              color: colors.onAccent,
+              size: 22,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            'Lumina',
+            style: TextStyle(
+              fontSize: 26,
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.6,
+              color: colors.textPrimary,
+            ),
+          ),
+          const Spacer(),
+          if (onRefresh != null)
+            IconButton(
+              onPressed: () {
+                LuminaHaptics.fire(context, HapticEvent.select);
+                onRefresh();
+              },
+              icon: Icon(
+                Icons.refresh_rounded,
+                color: colors.textSecondary,
+              ),
+              tooltip: 'Actualizar biblioteca',
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle(String title, int count) {
+    final colors = LuminaColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              letterSpacing: -0.4,
+              color: colors.textPrimary,
+            ),
+          ),
+          Text(
+            '$count canciones',
+            style: TextStyle(
+              color: colors.textTertiary,
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPlaylistsHeader(bool isDark) {
+    final colors = LuminaColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            'Mis Listas',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              letterSpacing: -0.4,
+              color: colors.textPrimary,
+            ),
+          ),
+          GestureDetector(
+            onTap: () {
+              LuminaHaptics.fire(context, HapticEvent.select);
+              _openCreatePlaylist();
+            },
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: colors.surfaceHighest,
+                shape: BoxShape.circle,
+                border: Border.all(color: colors.hairline, width: 1),
+              ),
+              child: Icon(
+                Icons.add_rounded,
+                color: colors.accent,
+                size: 24,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSearchBar() {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        decoration: BoxDecoration(
+          color: colors.surfaceHighest,
+          borderRadius: BorderRadius.circular(shapes.field),
+          border: Border.all(color: colors.hairline, width: 1),
+        ),
+        child: TextField(
+          onChanged: (value) => setState(() => _searchQuery = value),
+          style: TextStyle(color: colors.textPrimary),
+          decoration: InputDecoration(
+            hintText: 'Buscar...',
+            hintStyle: TextStyle(color: colors.textTertiary),
+            border: InputBorder.none,
+            icon: Icon(
+              Icons.search_rounded,
+              color: colors.textSecondary,
             ),
           ),
         ),
-      ],
-    ),
-  );
+      ),
+    );
+  }
 
-  Widget _buildSearchBar() => Padding(
-    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-    child: Container(
-      padding: const EdgeInsets.symmetric(horizontal: 15),
+  Widget _buildBottomNavBar() {
+    final colors = LuminaColors.of(context);
+    return DecoratedBox(
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(20),
+        color: colors.surfaceElevated,
+        border: Border(top: BorderSide(color: colors.hairline, width: 1)),
       ),
-      child: TextField(
-        onChanged: (value) => setState(() => _searchQuery = value),
-        style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
-        decoration: InputDecoration(
-          hintText: 'Buscar...',
-          hintStyle: TextStyle(
-            color: Theme.of(
-              context,
-            ).colorScheme.onSurface.withValues(alpha: 0.5),
-          ),
-          border: InputBorder.none,
-          icon: Icon(
-            Icons.search,
-            color: Theme.of(
-              context,
-            ).colorScheme.onSurface.withValues(alpha: 0.5),
-          ),
+      child: BottomNavigationBar(
+        currentIndex: _selectedIndex,
+        onTap: (i) {
+          LuminaHaptics.fire(context, HapticEvent.select);
+          setState(() {
+            _selectedIndex = i;
+            if (i != 2) _selectedPlaylist = null;
+          });
+        },
+        type: BottomNavigationBarType.fixed,
+        backgroundColor: colors.surfaceElevated,
+        selectedItemColor: colors.accentInk,
+        unselectedItemColor: colors.textTertiary,
+        selectedLabelStyle: const TextStyle(
+          fontWeight: FontWeight.w700,
+          fontSize: 12,
         ),
+        unselectedLabelStyle: const TextStyle(
+          fontWeight: FontWeight.w500,
+          fontSize: 12,
+        ),
+        elevation: 0,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.music_note_rounded),
+            activeIcon: Icon(Icons.music_note_rounded),
+            label: 'Librería',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.favorite_border_rounded),
+            activeIcon: Icon(Icons.favorite_rounded),
+            label: 'Favoritos',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.playlist_play_rounded),
+            activeIcon: Icon(Icons.playlist_play_rounded),
+            label: 'Listas',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined),
+            activeIcon: Icon(Icons.settings_rounded),
+            label: 'Ajustes',
+          ),
+        ],
       ),
-    ),
-  );
-
-  Widget _buildBottomNavBar() => BottomNavigationBar(
-    currentIndex: _selectedIndex,
-    onTap: (i) => setState(() {
-      _selectedIndex = i;
-      if (i != 2) _selectedPlaylist = null;
-    }),
-    type: BottomNavigationBarType.fixed,
-    backgroundColor: Theme.of(context).brightness == Brightness.dark
-        ? const Color(0xFF0A0A0A)
-        : Colors.white,
-    selectedItemColor: const Color(0xFF4CAF50),
-    unselectedItemColor: Colors.grey,
-    items: const [
-      BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Librería'),
-      BottomNavigationBarItem(icon: Icon(Icons.favorite), label: 'Favoritos'),
-      BottomNavigationBarItem(icon: Icon(Icons.list), label: 'Listas'),
-      BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Ajustes'),
-    ],
-  );
+    );
+  }
 }

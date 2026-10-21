@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:on_audio_query/on_audio_query.dart';
-import '../core/app_helpers.dart';
+import '../widgets/cached_artwork.dart';
 
 /// Pantalla para añadir canciones a una lista de reproducción existente.
 class AddSongsScreen extends StatefulWidget {
@@ -91,74 +91,54 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
           Expanded(
             child: _notAddedSongs.isEmpty
                 ? const Center(child: Text("No hay más canciones para añadir"))
-                : ListView.builder(
-                    itemCount: _notAddedSongs
-                        .where(
-                          (s) =>
-                              s.title.toLowerCase().contains(
-                                _searchQuery.toLowerCase(),
-                              ) ||
-                              (s.artist ?? "").toLowerCase().contains(
-                                _searchQuery.toLowerCase(),
-                              ),
-                        )
-                        .length,
-                    itemBuilder: (context, index) {
-                      final filteredSongs = _notAddedSongs
-                          .where(
-                            (s) =>
-                                s.title.toLowerCase().contains(
-                                  _searchQuery.toLowerCase(),
-                                ) ||
-                                (s.artist ?? "").toLowerCase().contains(
-                                  _searchQuery.toLowerCase(),
-                                ),
-                          )
-                          .toList();
-                      final song = filteredSongs[index];
-                      final isSelected = _selectedToAdd.contains(song);
-                      return CheckboxListTile(
-                        value: isSelected,
-                        activeColor: const Color(0xFF4CAF50),
-                        onChanged: (val) {
-                          setState(() {
-                            if (val == true) {
-                              _selectedToAdd.add(song);
-                            } else {
-                              _selectedToAdd.remove(song);
-                            }
-                          });
-                        },
-                        title: Text(
-                          song.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Text(song.artist ?? "Desconocido"),
-                        secondary: ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: SizedBox(
-                            width: 50,
-                            height: 50,
-                            child: QueryArtworkWidget(
-                              id: song.id,
-                              type: ArtworkType.AUDIO,
-                              format: ArtworkFormat.JPEG,
-                              size: 2000,
-                              artworkWidth: 50,
-                              artworkHeight: 50,
-                              artworkBorder: BorderRadius.zero,
-                              artworkFit: BoxFit.cover,
-                              nullArtworkWidget:
-                                  AppHelpers.getRandomDefaultCover(
-                                    context: context,
-                                    id: song.id,
-                                    width: 50,
-                                    height: 50,
-                                  ),
+                : Builder(
+                    builder: (context) {
+                      final filteredSongs = _searchQuery.isEmpty
+                          ? _notAddedSongs
+                          : _notAddedSongs.where((s) {
+                              final q = _searchQuery.toLowerCase();
+                              return s.title.toLowerCase().contains(q) ||
+                                  (s.artist ?? "").toLowerCase().contains(q);
+                            }).toList();
+
+                      if (filteredSongs.isEmpty) {
+                        return const Center(child: Text("Sin resultados"));
+                      }
+
+                      return ListView.builder(
+                        itemExtent: 72.0,
+                        cacheExtent: 250,
+                        itemCount: filteredSongs.length,
+                        itemBuilder: (context, index) {
+                          final song = filteredSongs[index];
+                          final isSelected = _selectedToAdd.contains(song);
+                          return CheckboxListTile(
+                            value: isSelected,
+                            activeColor: const Color(0xFF4CAF50),
+                            onChanged: (val) {
+                              setState(() {
+                                if (val == true) {
+                                  _selectedToAdd.add(song);
+                                } else {
+                                  _selectedToAdd.remove(song);
+                                }
+                              });
+                            },
+                            title: Text(
+                              song.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                             ),
-                          ),
-                        ),
+                            subtitle: Text(song.artist ?? "Desconocido"),
+                            secondary: CachedArtwork(
+                              songId: song.id,
+                              width: 50,
+                              height: 50,
+                              borderRadius: 8,
+                              size: 150,
+                            ),
+                          );
+                        },
                       );
                     },
                   ),

@@ -1,28 +1,43 @@
 import 'package:flutter/material.dart';
 
-/// Utilidades estáticas compartidas en toda la app.
 class AppHelpers {
+  /// Portada predeterminada única: fondo gris elegante con una nota musical en medio.
+  static Widget getDefaultCover({
+    required BuildContext context,
+    int? id,
+    double? width,
+    double? height,
+  }) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final double iconSize = (width != null && height != null)
+        ? (width < height ? width : height) * 0.48
+        : (width != null ? width * 0.48 : (height != null ? height * 0.48 : 28));
+
+    return Container(
+      width: width,
+      height: height,
+      color: isDark ? const Color(0xFF282828) : const Color(0xFFE2E2E2),
+      alignment: Alignment.center,
+      child: Icon(
+        Icons.music_note_rounded,
+        size: iconSize.clamp(16.0, 96.0),
+        color: isDark ? Colors.white54 : Colors.black45,
+      ),
+    );
+  }
+
+  /// Mantenido por retrocompatibilidad: retorna la portada predeterminada única.
   static Widget getRandomDefaultCover({
     required BuildContext context,
     required int id,
     double? width,
     double? height,
   }) {
-    final coverIndex = (id.hashCode).abs() % 5 + 1;
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    return Container(
+    return getDefaultCover(
+      context: context,
+      id: id,
       width: width,
       height: height,
-      decoration: BoxDecoration(
-        image: DecorationImage(
-          image: AssetImage('assets/covers/cover_$coverIndex.png'),
-          fit: BoxFit.cover,
-        ),
-      ),
-      child: isDark
-          ? Container(color: Colors.black.withValues(alpha: 0.3))
-          : null,
     );
   }
 }

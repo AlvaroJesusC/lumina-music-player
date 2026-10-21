@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:image_picker/image_picker.dart';
 import '../models/playlist_model.dart';
-import '../core/app_helpers.dart';
+import '../widgets/cached_artwork.dart';
 
 /// Pantalla para crear o editar una lista de reproducción.
 class CreatePlaylistScreen extends StatefulWidget {
@@ -147,17 +147,10 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                                           ),
                                       itemCount: min(_selectedSongs.length, 4),
                                       itemBuilder: (context, i) =>
-                                          QueryArtworkWidget(
-                                            id: _selectedSongs[i].id,
-                                            type: ArtworkType.AUDIO,
-                                            format: ArtworkFormat.JPEG,
-                                            artworkBorder: BorderRadius.zero,
-                                            artworkFit: BoxFit.cover,
-                                            nullArtworkWidget:
-                                                AppHelpers.getRandomDefaultCover(
-                                                  context: context,
-                                                  id: _selectedSongs[i].id,
-                                                ),
+                                          CachedArtwork(
+                                            songId: _selectedSongs[i].id,
+                                            borderRadius: 0,
+                                            size: 150,
                                           ),
                                     ),
                             ),
@@ -272,82 +265,64 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
             ),
           ),
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              itemCount: widget.availableSongs
-                  .where(
-                    (s) =>
-                        s.title.toLowerCase().contains(
-                          _searchQuery.toLowerCase(),
-                        ) ||
-                        (s.artist ?? "").toLowerCase().contains(
-                          _searchQuery.toLowerCase(),
-                        ),
-                  )
-                  .length,
-              itemBuilder: (context, index) {
-                final filteredSongs = widget.availableSongs
-                    .where(
-                      (s) =>
-                          s.title.toLowerCase().contains(
-                            _searchQuery.toLowerCase(),
-                          ) ||
-                          (s.artist ?? "").toLowerCase().contains(
-                            _searchQuery.toLowerCase(),
-                          ),
-                    )
-                    .toList();
-                final song = filteredSongs[index];
-                final isSelected = _selectedSongs.any((s) => s.id == song.id);
-                return CheckboxListTile(
-                  value: isSelected,
-                  activeColor: const Color(0xFF4CAF50),
-                  checkboxShape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(5),
-                  ),
-                  title: Text(
-                    song.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: colorScheme.onSurface),
-                  ),
-                  subtitle: Text(
-                    song.artist ?? "Desconocido",
-                    style: TextStyle(
-                      color: colorScheme.onSurface.withValues(alpha: 0.5),
-                    ),
-                  ),
-                  secondary: ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: SizedBox(
-                      width: 50,
-                      height: 50,
-                      child: QueryArtworkWidget(
-                        id: song.id,
-                        type: ArtworkType.AUDIO,
-                        format: ArtworkFormat.JPEG,
-                        size: 2000,
-                        artworkWidth: 50,
-                        artworkHeight: 50,
-                        artworkBorder: BorderRadius.zero,
-                        artworkFit: BoxFit.cover,
-                        nullArtworkWidget: AppHelpers.getRandomDefaultCover(
-                          context: context,
-                          id: song.id,
-                          width: 50,
-                          height: 50,
+            child: Builder(
+              builder: (context) {
+                final filteredSongs = _searchQuery.isEmpty
+                    ? widget.availableSongs
+                    : widget.availableSongs.where((s) {
+                        final q = _searchQuery.toLowerCase();
+                        return s.title.toLowerCase().contains(q) ||
+                            (s.artist ?? "").toLowerCase().contains(q);
+                      }).toList();
+
+                if (filteredSongs.isEmpty) {
+                  return const Center(child: Text("Sin resultados"));
+                }
+
+                return ListView.builder(
+                  itemExtent: 72.0,
+                  cacheExtent: 250,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  itemCount: filteredSongs.length,
+                  itemBuilder: (context, index) {
+                    final song = filteredSongs[index];
+                    final isSelected =
+                        _selectedSongs.any((s) => s.id == song.id);
+                    return CheckboxListTile(
+                      value: isSelected,
+                      activeColor: const Color(0xFF4CAF50),
+                      checkboxShape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      title: Text(
+                        song.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: colorScheme.onSurface),
+                      ),
+                      subtitle: Text(
+                        song.artist ?? "Desconocido",
+                        style: TextStyle(
+                          color: colorScheme.onSurface.withValues(alpha: 0.5),
                         ),
                       ),
-                    ),
-                  ),
-                  onChanged: (val) {
-                    setState(() {
-                      if (val == true) {
-                        _selectedSongs.add(song);
-                      } else {
-                        _selectedSongs.removeWhere((s) => s.id == song.id);
-                      }
-                    });
+                      secondary: CachedArtwork(
+                        songId: song.id,
+                        width: 50,
+                        height: 50,
+                        borderRadius: 10,
+                        size: 150,
+                      ),
+                      onChanged: (val) {
+                        setState(() {
+                          if (val == true) {
+                            _selectedSongs.add(song);
+                          } else {
+                            _selectedSongs.removeWhere((s) => s.id == song.id);
+                          }
+                        });
+                      },
+                    );
                   },
                 );
               },
