@@ -7,6 +7,8 @@ import 'package:lumina_player/theme/lumina_motion.dart';
 import 'package:lumina_player/theme/lumina_shapes.dart';
 import 'package:lumina_player/theme/lumina_theme.dart';
 
+import 'package:lumina_player/widgets/player_background.dart';
+
 void main() {
   group('Lumina Theme Tests', () {
     test('buildLuminaTheme attaches all required extensions for dark mode', () {
@@ -38,6 +40,33 @@ void main() {
       expect(PlayerBackgroundStyle.parse('animated'), PlayerBackgroundStyle.animated);
       expect(PlayerBackgroundStyle.parse('unknown_corrupt_data'), PlayerBackgroundStyle.ambient);
       expect(PlayerBackgroundStyle.parse(null), PlayerBackgroundStyle.ambient);
+    });
+
+    testWidgets('PlayerBackground mounts cleanly with animated style without MediaQuery errors', (tester) async {
+      AppearanceSettings.instance.backgroundStyle.value = PlayerBackgroundStyle.animated;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildLuminaTheme(brightness: Brightness.dark),
+          home: const Scaffold(
+            body: PlayerBackground(
+              songId: 1,
+              child: Text('Content'),
+            ),
+          ),
+        ),
+      );
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('Content'), findsOneWidget);
+
+      // Advance frames without hanging on indefinite repeat animation
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(tester.takeException(), isNull);
+
+      // Reset to ambient for subsequent tests/state
+      AppearanceSettings.instance.backgroundStyle.value = PlayerBackgroundStyle.ambient;
+      await tester.pump(const Duration(milliseconds: 50));
     });
   });
 }

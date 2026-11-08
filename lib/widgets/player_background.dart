@@ -48,28 +48,34 @@ class _PlayerBackgroundState extends State<PlayerBackground>
       curve: LuminaMotion.standardSet.drift,
     );
 
-    if (AppearanceSettings.instance.backgroundStyle.value ==
-        PlayerBackgroundStyle.animated) {
-      _startDriftIfAllowed();
-    }
-
     AppearanceSettings.instance.backgroundStyle.addListener(_onStyleChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncDriftState();
   }
 
   void _onStyleChanged() {
     if (!mounted) return;
-    if (AppearanceSettings.instance.backgroundStyle.value ==
-        PlayerBackgroundStyle.animated) {
-      _startDriftIfAllowed();
-    } else {
-      _driftController.stop();
-    }
+    _syncDriftState();
     setState(() {});
   }
 
-  void _startDriftIfAllowed() {
-    if (!LuminaMotion.isReduced(context)) {
-      _driftController.repeat(reverse: true);
+  void _syncDriftState() {
+    final isAnimated = AppearanceSettings.instance.backgroundStyle.value ==
+        PlayerBackgroundStyle.animated;
+    final isReduced = LuminaMotion.isReduced(context);
+
+    if (isAnimated && !isReduced) {
+      if (!_driftController.isAnimating) {
+        _driftController.repeat(reverse: true);
+      }
+    } else {
+      if (_driftController.isAnimating) {
+        _driftController.stop();
+      }
     }
   }
 
@@ -88,6 +94,9 @@ class _PlayerBackgroundState extends State<PlayerBackground>
     return Stack(
       fit: StackFit.expand,
       children: [
+        // Base sólida que garantiza que cualquier estilo sea 100% opaco
+        ColoredBox(color: colors.background),
+
         // 1. Capa de Fondo (Aislada con RepaintBoundary)
         RepaintBoundary(
           child: switch (style) {
@@ -164,32 +173,56 @@ class _PlayerBackgroundState extends State<PlayerBackground>
       return _buildFixedGradient(colors);
     }
 
-    return AnimatedBuilder(
-      animation: _driftAnimation,
-      builder: (context, _) {
-        final t = _driftAnimation.value;
-        // Ciclo HSL suave con derivación cromática controlada
-        final hue1 = (145.0 + math.sin(t * math.pi) * 45.0) % 360.0;
-        final hue2 = (210.0 + math.cos(t * math.pi) * 35.0) % 360.0;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // Base sólida que garantiza que el degradado dinámico nunca sea transparente
+        ColoredBox(color: colors.background),
 
-        final color1 = colors.driftColor(hue1).withValues(alpha: 0.28);
-        final color2 = colors.driftColor(hue2).withValues(alpha: 0.20);
+        AnimatedBuilder(
+          animation: _driftAnimation,
+          builder: (context, _) {
+            final t = _driftAnimation.value;
+            // Ciclo HSL suave con derivación cromática controlada
+            final hue1 = (145.0 + math.sin(t * math.pi) * 45.0) % 360.0;
+            final hue2 = (210.0 + math.cos(t * math.pi) * 35.0) % 360.0;
 
-        return DecoratedBox(
+            final color1 = colors.driftColor(hue1).withValues(alpha: 0.32);
+            final color2 = colors.driftColor(hue2).withValues(alpha: 0.22);
+
+            return DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    color1,
+                    color2,
+                    colors.background,
+                  ],
+                  stops: const [0.0, 0.45, 1.0],
+                ),
+              ),
+            );
+          },
+        ),
+
+        // Velo tenue inferior para garantizar legibilidad y contraste óptimo en controles
+        DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
               colors: [
-                color1,
-                color2,
+                Colors.transparent,
+                colors.background.withValues(alpha: 0.85),
                 colors.background,
               ],
-              stops: const [0.0, 0.45, 1.0],
+              stops: const [0.55, 0.85, 1.0],
             ),
           ),
-        );
-      },
+        ),
+      ],
     );
   }
 }
