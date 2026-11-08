@@ -108,6 +108,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   int _selectedIndex = 0;
   final List<SongModel> _songs = [];
   final Set<int> _favoriteIds = {};
+  final Set<int> _hiddenSongIds = {};
   final List<PlaylistModelCustom> _playlists = [];
   PlaylistModelCustom? _selectedPlaylist;
   bool _isLoading = true;
@@ -122,6 +123,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     super.initState();
     // EJECUCIÓN SEGURA: Esperamos a que la Activity esté vinculada
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadHiddenSongs();
       _requestPermissions();
       _loadFavorites();
       _loadPlaylists();
@@ -259,6 +261,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
 
   Future<void> _loadSongs() async {
     try {
+      await _loadHiddenSongs();
       final songs = await _audioQuery.querySongs(
         sortType: null,
         orderType: OrderType.ASC_OR_SMALLER,
@@ -268,7 +271,12 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       if (mounted) {
         setState(() {
           _songs.clear();
-          _songs.addAll(songs.where((song) => song.isMusic == true).toList());
+          _songs.addAll(
+            songs
+                .where((song) =>
+                    song.isMusic == true && !_hiddenSongIds.contains(song.id))
+                .toList(),
+          );
           _isLoading = false;
         });
       }
@@ -412,6 +420,49 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
   }
 
+  Future<void> _loadHiddenSongs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final hidden = prefs.getStringList('hidden_songs') ?? [];
+      _hiddenSongIds.clear();
+      _hiddenSongIds.addAll(
+        hidden.map((e) => int.tryParse(e)).whereType<int>(),
+      );
+    } catch (e) {
+      debugPrint("Error cargando canciones ocultas: $e");
+    }
+  }
+
+  Future<void> _saveHiddenSongs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+        'hidden_songs',
+        _hiddenSongIds.map((e) => e.toString()).toList(),
+      );
+    } catch (e) {
+      debugPrint("Error guardando canciones ocultas: $e");
+    }
+  }
+
+  void _restoreHiddenSongs() async {
+    setState(() {
+      _hiddenSongIds.clear();
+    });
+    await _saveHiddenSongs();
+    await _loadSongs();
+    if (mounted) {
+      LuminaHaptics.fire(context, HapticEvent.select);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Canciones ocultas restauradas'),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: Color(0xFF4CAF50),
+        ),
+      );
+    }
+  }
+
   Future<void> _loadPlaylists() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -421,7 +472,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         setState(() {
           _playlists.clear();
           _playlists.addAll(
-            decodedData.map((json) => PlaylistModelCustom.fromJson(json)),
+            decodedData.map((json) {
+              final playlist = PlaylistModelCustom.fromJson(json);
+              if (_hiddenSongIds.isNotEmpty) {
+                playlist.songs.removeWhere((s) => _hiddenSongIds.contains(s.id));
+              }
+              return playlist;
+            }),
           );
         });
       }
@@ -1004,6 +1061,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     SongModel song,
     List<SongModel> list, {
     bool isSelected = false,
+    PlaylistModelCustom? playlist,
   }) {
     final colorScheme = Theme.of(context).colorScheme;
     final isFavorite = _favoriteIds.contains(song.id);
@@ -1079,7 +1137,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                     Icons.more_vert_rounded,
                     color: colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
-                  onPressed: () => _showSongOptions(context, song),
+                  onPressed: () =>
+                      _showSongOptions(context, song, playlist: playlist),
                 ),
               ],
             ),
@@ -1276,6 +1335,49 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 stream: audioHandler.mediaItem,
                 builder: (context, mediaSnapshot) {
                   final playingId = mediaSnapshot.data?.id;
+                  if (playlist.songs.isEmpty) {
+                    return SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 40),
+                        child: Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.music_note_rounded,
+                                size: 50,
+                                color: colorScheme.onSurface
+                                    .withValues(alpha: 0.3),
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                'Esta lista no tiene canciones',
+                                style: TextStyle(
+                                  color: colorScheme.onSurface
+                                      .withValues(alpha: 0.5),
+                                  fontSize: 16,
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              ElevatedButton.icon(
+                                onPressed: () =>
+                                    _openAddSongsToPlaylist(playlist),
+                                icon: const Icon(Icons.add_rounded),
+                                label: const Text('Añadir canciones'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF4CAF50),
+                                  foregroundColor: Colors.white,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  }
                   return SliverFixedExtentList(
                     itemExtent: 80.0,
                     delegate: SliverChildBuilderDelegate((context, index) {
@@ -1284,6 +1386,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                         song,
                         playlist.songs,
                         isSelected: playingId == '${song.id}',
+                        playlist: playlist,
                       );
                     }, childCount: playlist.songs.length),
                   );
@@ -1685,6 +1788,54 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
+  void _removeSongFromPlaylist(SongModel song, PlaylistModelCustom playlist) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Eliminar de la playlist'),
+        content: Text(
+          '¿Deseas quitar "${_getSongTitle(song)}" de "${playlist.name}"?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('CANCELAR'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              setState(() {
+                playlist.songs.removeWhere((s) => s.id == song.id);
+                final pIndex =
+                    _playlists.indexWhere((p) => p.id == playlist.id);
+                if (pIndex != -1 && !identical(_playlists[pIndex], playlist)) {
+                  _playlists[pIndex].songs.removeWhere((s) => s.id == song.id);
+                }
+              });
+              _savePlaylists();
+              if (mounted) {
+                LuminaHaptics.fire(context, HapticEvent.select);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      '"${_getSongTitle(song)}" eliminada de "${playlist.name}"',
+                    ),
+                    behavior: SnackBarBehavior.floating,
+                    backgroundColor: Colors.redAccent,
+                  ),
+                );
+              }
+            },
+            child: const Text(
+              'ELIMINAR',
+              style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSettingsContent() {
     return Container(
       decoration: _buildBackgroundDecoration(),
@@ -1783,6 +1934,24 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                         ? null
                         : _verificarActualizacionManual,
                   ),
+                  if (_hiddenSongIds.isNotEmpty)
+                    _buildSettingTile(
+                      icon: Icons.visibility_rounded,
+                      title: 'Restaurar canciones ocultas',
+                      subtitle:
+                          '${_hiddenSongIds.length} canción(es) oculta(s) de la biblioteca',
+                      trailing: TextButton(
+                        onPressed: _restoreHiddenSongs,
+                        child: const Text(
+                          'RESTAURAR',
+                          style: TextStyle(
+                            color: Color(0xFF4CAF50),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      onTap: _restoreHiddenSongs,
+                    ),
                 ],
               ),
             ),
@@ -1960,7 +2129,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  void _showSongOptions(BuildContext context, SongModel song) {
+  void _showSongOptions(
+    BuildContext context,
+    SongModel song, {
+    PlaylistModelCustom? playlist,
+  }) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     showModalBottomSheet(
@@ -1969,7 +2142,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (context) {
+      builder: (bottomSheetContext) {
         return SafeArea(
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 10),
@@ -2010,7 +2183,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   leading: const Icon(Icons.edit_rounded),
                   title: const Text('Editar canción'),
                   onTap: () {
-                    Navigator.pop(context);
+                    Navigator.pop(bottomSheetContext);
                     _showEditSongDialog(song);
                   },
                 ),
@@ -2018,7 +2191,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   leading: const Icon(Icons.playlist_add_rounded),
                   title: const Text('Agregar a lista de reproducción'),
                   onTap: () {
-                    Navigator.pop(context);
+                    Navigator.pop(bottomSheetContext);
                     _showAddToPlaylistDialog(song);
                   },
                 ),
@@ -2026,7 +2199,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   leading: const Icon(Icons.queue_music_rounded),
                   title: const Text('Añadir a la cola de reproducción'),
                   onTap: () {
-                    Navigator.pop(context);
+                    Navigator.pop(bottomSheetContext);
                     _addToQueue(song);
                   },
                 ),
@@ -2034,24 +2207,43 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   leading: const Icon(Icons.format_list_bulleted_rounded),
                   title: const Text('Ver fila de reproducción'),
                   onTap: () {
-                    Navigator.pop(context);
+                    Navigator.pop(bottomSheetContext);
                     QueueBottomSheet.show(context, audioHandler);
                   },
                 ),
-                ListTile(
-                  leading: const Icon(
-                    Icons.visibility_off_rounded,
-                    color: Colors.red,
+                if (playlist != null)
+                  ListTile(
+                    leading: const Icon(
+                      Icons.playlist_remove_rounded,
+                      color: Colors.red,
+                    ),
+                    title: const Text(
+                      'Eliminar de la playlist',
+                      style: TextStyle(
+                        color: Colors.red,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.pop(bottomSheetContext);
+                      _removeSongFromPlaylist(song, playlist);
+                    },
+                  )
+                else
+                  ListTile(
+                    leading: const Icon(
+                      Icons.visibility_off_rounded,
+                      color: Colors.red,
+                    ),
+                    title: const Text(
+                      'Ocultar canción (Eliminar de la vista)',
+                      style: TextStyle(color: Colors.red),
+                    ),
+                    onTap: () {
+                      Navigator.pop(bottomSheetContext);
+                      _deleteSong(song);
+                    },
                   ),
-                  title: const Text(
-                    'Ocultar canción (Eliminar de la vista)',
-                    style: TextStyle(color: Colors.red),
-                  ),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _deleteSong(song);
-                  },
-                ),
               ],
             ),
           ),
@@ -2235,14 +2427,23 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                           if (!alreadyAdded) {
                             setState(() {
                               playlist.songs.add(song);
+                              if (_selectedPlaylist?.id == playlist.id &&
+                                  !identical(_selectedPlaylist, playlist)) {
+                                _selectedPlaylist?.songs.add(song);
+                              }
                             });
                             _savePlaylists();
-                            ScaffoldMessenger.of(this.context).showSnackBar(
-                              SnackBar(
-                                content: Text('Agregada a "${playlist.name}"'),
-                                backgroundColor: const Color(0xFF6C63FF),
-                              ),
-                            );
+                            if (mounted) {
+                              LuminaHaptics.fire(context, HapticEvent.select);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content:
+                                      Text('Agregada a "${playlist.name}"'),
+                                  behavior: SnackBarBehavior.floating,
+                                  backgroundColor: const Color(0xFF4CAF50),
+                                ),
+                              );
+                            }
                           }
                         },
                       );
@@ -2350,33 +2551,47 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   void _deleteSong(SongModel song) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Ocultar canción'),
         content: Text(
-          'Debido a restricciones de Android, la canción no se borrará de tu teléfono centralmente, pero se ocultará de Lumina Player.\n\n¿Deseas ocultar "${song.title}"?',
+          'Debido a restricciones de Android, la canción no se borrará de tu almacenamiento, pero se ocultará de Lumina Player.\n\n¿Deseas ocultar "${_getSongTitle(song)}"?',
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('CANCELAR'),
           ),
           TextButton(
             onPressed: () {
-              Navigator.pop(context);
+              Navigator.pop(dialogContext);
               setState(() {
+                _hiddenSongIds.add(song.id);
                 _songs.removeWhere((s) => s.id == song.id);
                 // Also remove from favorites if it was there
                 if (_favoriteIds.contains(song.id)) {
                   _favoriteIds.remove(song.id);
                   _saveFavorites();
                 }
+                // Also remove from all playlists
+                for (final p in _playlists) {
+                  p.songs.removeWhere((s) => s.id == song.id);
+                }
               });
-              ScaffoldMessenger.of(this.context).showSnackBar(
-                const SnackBar(
-                  content: Text('Canción ocultada exitosamente'),
-                  backgroundColor: Colors.red,
-                ),
-              );
+              _saveHiddenSongs();
+              _savePlaylists();
+              if (mounted) {
+                LuminaHaptics.fire(context, HapticEvent.select);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      '"${_getSongTitle(song)}" ocultada de la biblioteca',
+                    ),
+                    behavior: SnackBarBehavior.floating,
+                    backgroundColor: Colors.redAccent,
+                    duration: const Duration(seconds: 3),
+                  ),
+                );
+              }
             },
             child: const Text('OCULTAR', style: TextStyle(color: Colors.red)),
           ),
