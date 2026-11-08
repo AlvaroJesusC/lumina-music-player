@@ -7,10 +7,12 @@ import 'package:audio_service/audio_service.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../models/playlist_model.dart';
 import '../services/appearance_settings.dart';
 import '../services/audio_handler.dart';
 import '../services/audio_service_instance.dart';
+import '../servicios/servicio_actualizador.dart';
 import '../theme/lumina_colors.dart';
 import '../theme/lumina_haptics.dart';
 import '../theme/lumina_shapes.dart';
@@ -19,6 +21,7 @@ import 'add_songs_screen.dart';
 import 'full_player_screen.dart';
 import '../widgets/queue_bottom_sheet.dart';
 import '../widgets/cached_artwork.dart';
+import '../widgets/dialogo_actualizacion.dart';
 import '../widgets/lumina_mini_player.dart';
 
 
@@ -111,6 +114,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   String _searchQuery = "";
   String _playlistSearchQuery = "";
   final Map<int, Map<String, String>> _customMetadata = {};
+  String _versionActual = '1.0.0';
+  bool _comprobandoActualizacion = false;
 
   @override
   void initState() {
@@ -121,7 +126,115 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       _loadFavorites();
       _loadPlaylists();
       _loadCustomMetadata();
+      _comprobarActualizacionesAlInicio();
     });
+  }
+
+  Future<void> _comprobarActualizacionesAlInicio() async {
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      if (mounted) {
+        setState(() {
+          _versionActual = packageInfo.version;
+        });
+      }
+      final info = await ServicioActualizador.verificarActualizacion(forzar: false);
+      if (info != null && info.hayNuevaVersion && mounted) {
+        await DialogoActualizacion.mostrar(context, info: info);
+      }
+    } catch (e) {
+      debugPrint('Error comprobando actualizaciones al inicio: $e');
+    }
+  }
+
+  Future<void> _verificarActualizacionManual() async {
+    if (_comprobandoActualizacion) return;
+    setState(() => _comprobandoActualizacion = true);
+
+    final colors = LuminaColors.of(context);
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+
+    scaffoldMessenger.showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(colors.accent),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Text(
+              'Buscando actualizaciones en GitHub...',
+              style: TextStyle(
+                color: colors.textPrimary,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: colors.surfaceElevated,
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: colors.hairline),
+        ),
+      ),
+    );
+
+    try {
+      final info = await ServicioActualizador.verificarActualizacion(forzar: true);
+      if (!mounted) return;
+
+      setState(() => _comprobandoActualizacion = false);
+
+      if (info != null && info.hayNuevaVersion) {
+        await DialogoActualizacion.mostrar(context, info: info);
+      } else {
+        scaffoldMessenger.hideCurrentSnackBar();
+        scaffoldMessenger.showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                Icon(Icons.check_circle_rounded, color: colors.accent, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Lumina Player está en su versión más reciente (v$_versionActual)',
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: colors.surfaceElevated,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: colors.hairline),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _comprobandoActualizacion = false);
+      scaffoldMessenger.hideCurrentSnackBar();
+      scaffoldMessenger.showSnackBar(
+        SnackBar(
+          content: Text('No se pudo verificar: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
   }
 
   Future<void> _requestPermissions() async {
@@ -1646,6 +1759,29 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                         ),
                       );
                     },
+                  ),
+                  _buildSettingTile(
+                    icon: Icons.system_update_rounded,
+                    title: 'Buscar Actualizaciones',
+                    subtitle: 'Versión actual: v$_versionActual',
+                    trailing: _comprobandoActualizacion
+                        ? SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                LuminaColors.of(context).accent,
+                              ),
+                            ),
+                          )
+                        : Icon(
+                            Icons.cloud_download_outlined,
+                            color: LuminaColors.of(context).textTertiary,
+                          ),
+                    onTap: _comprobandoActualizacion
+                        ? null
+                        : _verificarActualizacionManual,
                   ),
                 ],
               ),
