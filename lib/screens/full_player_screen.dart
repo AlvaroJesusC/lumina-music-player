@@ -176,7 +176,8 @@ class _PlayerHeader extends StatelessWidget {
 }
 
 /// Carátula animada con escala orgánica entre reproducción y pausa
-class _PlayerArtwork extends StatelessWidget {
+/// y soporte de gestos horizontales (Swipe) para cambiar de pista con física suave.
+class _PlayerArtwork extends StatefulWidget {
   final int songId;
   final double size;
   final LuminaColors colors;
@@ -190,49 +191,201 @@ class _PlayerArtwork extends StatelessWidget {
   });
 
   @override
+  State<_PlayerArtwork> createState() => _PlayerArtworkState();
+}
+
+class _PlayerArtworkState extends State<_PlayerArtwork>
+    with SingleTickerProviderStateMixin {
+  double _dragOffset = 0.0;
+  int _slideDirection = -1; // -1 = siguiente (entra desde derecha), 1 = anterior
+  late final AnimationController _snapController;
+  Animation<double>? _snapAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _snapController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 280),
+    )..addListener(() {
+        final anim = _snapAnimation;
+        if (mounted && anim != null) {
+          setState(() {
+            _dragOffset = anim.value;
+          });
+        }
+      });
+  }
+
+  @override
+  void dispose() {
+    _snapController.dispose();
+    super.dispose();
+  }
+
+  void _animateDragToZero() {
+    if (_dragOffset == 0.0) return;
+    final motion = LuminaMotion.of(context);
+    final duration = LuminaMotion.resolve(context, motion.medium);
+    if (duration == Duration.zero) {
+      setState(() => _dragOffset = 0.0);
+      return;
+    }
+    _snapController.duration = duration;
+    _snapAnimation = Tween<double>(
+      begin: _dragOffset,
+      end: 0.0,
+    ).animate(
+      CurvedAnimation(
+        parent: _snapController,
+        curve: motion.emphasized,
+      ),
+    );
+    _snapController.forward(from: 0.0);
+  }
+
+  void _onHorizontalDragStart(DragStartDetails details) {
+    _snapController.stop();
+  }
+
+  void _onHorizontalDragUpdate(DragUpdateDetails details) {
+    setState(() {
+      _dragOffset = (_dragOffset + details.delta.dx * 0.85)
+          .clamp(-widget.size * 0.55, widget.size * 0.55);
+    });
+  }
+
+  void _onHorizontalDragEnd(DragEndDetails details) {
+    final velocity = details.primaryVelocity ?? 0.0;
+    final threshold = widget.size * 0.22;
+    final swipedNext = _dragOffset < -threshold || velocity < -380.0;
+    final swipedPrev = _dragOffset > threshold || velocity > 380.0;
+
+    if (swipedNext) {
+      _slideDirection = -1;
+      LuminaHaptics.fire(context, HapticEvent.commit);
+      _animateDragToZero();
+      unawaited(
+        widget.audioHandler.skipToNext().catchError((
+          Object error,
+          StackTrace stack,
+        ) {
+          debugPrint('Error skipping to next via swipe: $error\n$stack');
+        }),
+      );
+    } else if (swipedPrev) {
+      _slideDirection = 1;
+      LuminaHaptics.fire(context, HapticEvent.commit);
+      _animateDragToZero();
+      unawaited(
+        widget.audioHandler.skipToPrevious().catchError((
+          Object error,
+          StackTrace stack,
+        ) {
+          debugPrint('Error skipping to previous via swipe: $error\n$stack');
+        }),
+      );
+    } else {
+      _animateDragToZero();
+    }
+  }
+
+  void _onHorizontalDragCancel() {
+    _animateDragToZero();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final shapes = LuminaShapes.of(context);
     final motion = LuminaMotion.of(context);
+    final isReduced = LuminaMotion.isReduced(context);
 
     return RepaintBoundary(
-      child: StreamBuilder<PlaybackState>(
-        stream: audioHandler.playbackState,
-        builder: (context, snapshot) {
-          final isPlaying = snapshot.data?.playing ?? false;
-          final scale = isPlaying ? 1.0 : 0.93;
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragStart: _onHorizontalDragStart,
+        onHorizontalDragUpdate: _onHorizontalDragUpdate,
+        onHorizontalDragEnd: _onHorizontalDragEnd,
+        onHorizontalDragCancel: _onHorizontalDragCancel,
+        child: StreamBuilder<PlaybackState>(
+          stream: widget.audioHandler.playbackState,
+          builder: (context, snapshot) {
+            final isPlaying = snapshot.data?.playing ?? false;
+            final scale = isPlaying ? 1.0 : 0.93;
 
-          return AnimatedScale(
-            scale: LuminaMotion.isReduced(context) ? 1.0 : scale,
-            duration: LuminaMotion.resolve(context, motion.long),
-            curve: motion.standard,
-            child: Container(
-              width: size,
-              height: size,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(shapes.artworkLarge),
-                boxShadow: [
-                  BoxShadow(
-                    color: colors.shadow,
-                    blurRadius: 28,
-                    offset: const Offset(0, 14),
+            return AnimatedScale(
+              scale: isReduced ? 1.0 : scale,
+              duration: LuminaMotion.resolve(context, motion.long),
+              curve: motion.standard,
+              child: Transform.translate(
+                offset: Offset(_dragOffset, 0.0),
+                child: Transform.rotate(
+                  angle: isReduced ? 0.0 : (_dragOffset / widget.size) * 0.07,
+                  child: AnimatedSwitcher(
+                    duration: LuminaMotion.resolve(context, motion.medium),
+                    switchInCurve: motion.emphasized,
+                    switchOutCurve: motion.press,
+                    transitionBuilder: (child, animation) {
+                      if (isReduced) {
+                        return FadeTransition(opacity: animation, child: child);
+                      }
+                      final isIncoming =
+                          child.key == ValueKey<int>(widget.songId);
+                      final double dx = isIncoming
+                          ? (-_slideDirection * 0.22)
+                          : (_slideDirection * 0.22);
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                            begin: Offset(dx, 0.0),
+                            end: Offset.zero,
+                          ).animate(animation),
+                          child: ScaleTransition(
+                            scale: Tween<double>(
+                              begin: 0.92,
+                              end: 1.0,
+                            ).animate(animation),
+                            child: child,
+                          ),
+                        ),
+                      );
+                    },
+                    child: Container(
+                      key: ValueKey<int>(widget.songId),
+                      width: widget.size,
+                      height: widget.size,
+                      decoration: BoxDecoration(
+                        borderRadius:
+                            BorderRadius.circular(shapes.artworkLarge),
+                        boxShadow: [
+                          BoxShadow(
+                            color: widget.colors.shadow,
+                            blurRadius: 28,
+                            offset: const Offset(0, 14),
+                          ),
+                          BoxShadow(
+                            color: widget.colors.accentGlow
+                                .withValues(alpha: 0.18),
+                            blurRadius: 36,
+                            offset: const Offset(0, 6),
+                          ),
+                        ],
+                      ),
+                      child: CachedArtwork(
+                        songId: widget.songId,
+                        width: widget.size,
+                        height: widget.size,
+                        borderRadius: shapes.artworkLarge,
+                        size: 500,
+                      ),
+                    ),
                   ),
-                  BoxShadow(
-                    color: colors.accentGlow.withValues(alpha: 0.18),
-                    blurRadius: 36,
-                    offset: const Offset(0, 6),
-                  ),
-                ],
+                ),
               ),
-              child: CachedArtwork(
-                songId: songId,
-                width: size,
-                height: size,
-                borderRadius: shapes.artworkLarge,
-                size: 500,
-              ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }

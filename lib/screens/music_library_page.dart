@@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/playlist_model.dart';
 import '../services/appearance_settings.dart';
+import '../services/library_filter_settings.dart';
 import '../services/audio_handler.dart';
 import '../services/audio_service_instance.dart';
 import '../servicios/servicio_actualizador.dart';
@@ -22,6 +23,7 @@ import 'full_player_screen.dart';
 import '../widgets/queue_bottom_sheet.dart';
 import '../widgets/cached_artwork.dart';
 import '../widgets/dialogo_actualizacion.dart';
+import '../widgets/library_filter_sheets.dart';
 import '../widgets/lumina_mini_player.dart';
 
 
@@ -106,6 +108,8 @@ class MusicLibraryPage extends StatefulWidget {
 class _MusicLibraryPageState extends State<MusicLibraryPage> {
   final OnAudioQuery _audioQuery = OnAudioQuery();
   int _selectedIndex = 0;
+  final List<SongModel> _allRawSongs = [];
+  final Map<String, int> _detectedFolders = {};
   final List<SongModel> _songs = [];
   final Set<int> _favoriteIds = {};
   final Set<int> _hiddenSongIds = {};
@@ -114,6 +118,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   bool _isLoading = true;
   String _searchQuery = "";
   String _playlistSearchQuery = "";
+  RecentAddedFilter _recentFilter = RecentAddedFilter.all;
   final Map<int, Map<String, String>> _customMetadata = {};
   String _versionActual = '1.0.0';
   bool _comprobandoActualizacion = false;
@@ -270,13 +275,17 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       );
       if (mounted) {
         setState(() {
-          _songs.clear();
-          _songs.addAll(
-            songs
-                .where((song) =>
-                    song.isMusic == true && !_hiddenSongIds.contains(song.id))
-                .toList(),
-          );
+          _allRawSongs
+            ..clear()
+            ..addAll(songs);
+          _detectedFolders.clear();
+          for (final song in songs) {
+            if (song.isMusic == true) {
+              final folder = LibraryFilterSettings.extractFolderPath(song.data);
+              _detectedFolders[folder] = (_detectedFolders[folder] ?? 0) + 1;
+            }
+          }
+          _recomputeLibrarySongs();
           _isLoading = false;
         });
       }
@@ -284,6 +293,66 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       debugPrint('Error: $e');
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  /// Aplica los filtros de duración mínima, tonos del sistema, lista negra de
+  /// carpetas y ordenamiento seleccionado sobre [_allRawSongs].
+  void _recomputeLibrarySongs() {
+    final filterSettings = LibraryFilterSettings.instance;
+    final filtered = _allRawSongs
+        .where((song) => filterSettings.shouldIncludeSong(song, _hiddenSongIds))
+        .toList();
+
+    final sortOption = filterSettings.sortOption.value;
+    filtered.sort((a, b) {
+      return switch (sortOption) {
+        SongSortOption.titleAsc => _getSongTitle(a)
+            .toLowerCase()
+            .compareTo(_getSongTitle(b).toLowerCase()),
+        SongSortOption.titleDesc => _getSongTitle(b)
+            .toLowerCase()
+            .compareTo(_getSongTitle(a).toLowerCase()),
+        SongSortOption.artistAsc => () {
+            final cmp = _getSongArtist(a)
+                .toLowerCase()
+                .compareTo(_getSongArtist(b).toLowerCase());
+            if (cmp != 0) return cmp;
+            return _getSongTitle(a)
+                .toLowerCase()
+                .compareTo(_getSongTitle(b).toLowerCase());
+          }(),
+        SongSortOption.dateAddedDesc => () {
+            final da = LibraryFilterSettings.resolveSongDate(a)
+                    ?.millisecondsSinceEpoch ??
+                0;
+            final db = LibraryFilterSettings.resolveSongDate(b)
+                    ?.millisecondsSinceEpoch ??
+                0;
+            final cmp = db.compareTo(da);
+            if (cmp != 0) return cmp;
+            return _getSongTitle(a)
+                .toLowerCase()
+                .compareTo(_getSongTitle(b).toLowerCase());
+          }(),
+        SongSortOption.dateAddedAsc => () {
+            final da = LibraryFilterSettings.resolveSongDate(a)
+                    ?.millisecondsSinceEpoch ??
+                0;
+            final db = LibraryFilterSettings.resolveSongDate(b)
+                    ?.millisecondsSinceEpoch ??
+                0;
+            final cmp = da.compareTo(db);
+            if (cmp != 0) return cmp;
+            return _getSongTitle(a)
+                .toLowerCase()
+                .compareTo(_getSongTitle(b).toLowerCase());
+          }(),
+      };
+    });
+
+    _songs
+      ..clear()
+      ..addAll(filtered);
   }
 
   Future<void> _refreshLibrary() async {
@@ -304,11 +373,19 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   List<SongModel> get _filteredSongs {
-    if (_searchQuery.isEmpty) return _songs;
+    final now = DateTime.now();
+    final query = _searchQuery.toLowerCase();
     return _songs.where((song) {
-      final title = song.title.toLowerCase();
-      final artist = (song.artist ?? '').toLowerCase();
-      final query = _searchQuery.toLowerCase();
+      if (!LibraryFilterSettings.matchesRecentFilter(
+        song,
+        _recentFilter,
+        now,
+      )) {
+        return false;
+      }
+      if (query.isEmpty) return true;
+      final title = _getSongTitle(song).toLowerCase();
+      final artist = _getSongArtist(song).toLowerCase();
       return title.contains(query) || artist.contains(query);
     }).toList();
   }
@@ -316,10 +393,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   List<SongModel> get _favoriteSongs {
     final favorites = _songs.where((s) => _favoriteIds.contains(s.id)).toList();
     if (_searchQuery.isEmpty) return favorites;
+    final query = _searchQuery.toLowerCase();
     return favorites.where((song) {
-      final title = song.title.toLowerCase();
-      final artist = (song.artist ?? '').toLowerCase();
-      final query = _searchQuery.toLowerCase();
+      final title = _getSongTitle(song).toLowerCase();
+      final artist = _getSongArtist(song).toLowerCase();
       return title.contains(query) || artist.contains(query);
     }).toList();
   }
@@ -381,6 +458,9 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           decodedData.forEach((key, value) {
             _customMetadata[int.parse(key)] = Map<String, String>.from(value);
           });
+          if (_allRawSongs.isNotEmpty) {
+            _recomputeLibrarySongs();
+          }
         });
       }
     } catch (e) {
@@ -604,6 +684,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
 
   Widget _buildLibraryContent() {
     final displaySongs = _filteredSongs;
+    final colors = LuminaColors.of(context);
     return Container(
       decoration: _buildBackgroundDecoration(),
       child: SafeArea(
@@ -612,7 +693,24 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             _buildHeader(onRefresh: _refreshLibrary),
             _buildSectionTitle('Tu Biblioteca', displaySongs.length),
             _buildSearchBar(),
-            const SizedBox(height: 20),
+            LibraryFilterBar(
+              activeRecentFilter: _recentFilter,
+              activeSortOption: LibraryFilterSettings.instance.sortOption.value,
+              onRecentFilterChanged: (filter) {
+                setState(() => _recentFilter = filter);
+              },
+              onOpenSortSheet: () {
+                SortBottomSheet.show(
+                  context,
+                  onChanged: () {
+                    if (mounted) {
+                      setState(_recomputeLibrarySongs);
+                    }
+                  },
+                );
+              },
+            ),
+            const SizedBox(height: 8),
             Expanded(
               child: RefreshIndicator(
                 onRefresh: _refreshLibrary,
@@ -625,24 +723,66 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                         key: const PageStorageKey('library_empty'),
                         children: [
                           SizedBox(
-                            height: MediaQuery.of(context).size.height * 0.2,
+                            height: MediaQuery.of(context).size.height * 0.16,
                           ),
                           Center(
-                            child: Column(
-                              children: [
-                                Icon(
-                                  Icons.search_off_rounded,
-                                  size: 60,
-                                  color: Colors.grey[800],
-                                ),
-                                const SizedBox(height: 10),
-                                Text(
-                                  _searchQuery.isEmpty
-                                      ? "No se encontró música"
-                                      : "Sin resultados",
-                                  style: TextStyle(color: Colors.grey[600]),
-                                ),
-                              ],
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 32,
+                              ),
+                              child: Column(
+                                children: [
+                                  Icon(
+                                    _recentFilter != RecentAddedFilter.all
+                                        ? Icons.schedule_rounded
+                                        : Icons.search_off_rounded,
+                                    size: 56,
+                                    color: colors.textTertiary,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Text(
+                                    _searchQuery.isNotEmpty
+                                        ? 'Sin resultados para "$_searchQuery"'
+                                        : _recentFilter != RecentAddedFilter.all
+                                        ? 'No hay canciones añadidas en ${_recentFilter.label.toLowerCase()}'
+                                        : 'No se encontró música',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: colors.textSecondary,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                  if (_recentFilter != RecentAddedFilter.all &&
+                                      _searchQuery.isEmpty) ...[
+                                    const SizedBox(height: 12),
+                                    TextButton.icon(
+                                      onPressed: () {
+                                        LuminaHaptics.fire(
+                                          context,
+                                          HapticEvent.select,
+                                        );
+                                        setState(
+                                          () => _recentFilter =
+                                              RecentAddedFilter.all,
+                                        );
+                                      },
+                                      icon: Icon(
+                                        Icons.library_music_rounded,
+                                        size: 18,
+                                        color: colors.accent,
+                                      ),
+                                      label: Text(
+                                        'Ver todas las canciones',
+                                        style: TextStyle(
+                                          color: colors.accent,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
                             ),
                           ),
                         ],
@@ -666,6 +806,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                               return _buildMusicCard(
                                 song,
                                 isSelected: playingId == '${song.id}',
+                                fromList: displaySongs,
                               );
                             },
                           );
@@ -736,6 +877,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                             return _buildMusicCard(
                               song,
                               isSelected: playingId == '${song.id}',
+                              fromList: favorites,
                             );
                           },
                         );
@@ -1911,6 +2053,53 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       );
                     },
                   ),
+                  ValueListenableBuilder<MinDurationFilter>(
+                    valueListenable: LibraryFilterSettings.instance.minDuration,
+                    builder: (context, minDur, _) {
+                      return _buildSettingTile(
+                        icon: Icons.timer_outlined,
+                        title: 'Ocultar Audios Cortos',
+                        subtitle: '${minDur.label} — ${minDur.description}',
+                        trailing: Icon(
+                          Icons.chevron_right_rounded,
+                          color: LuminaColors.of(context).textTertiary,
+                        ),
+                        onTap: () => MinDurationFilterSheet.show(
+                          context,
+                          onChanged: () {
+                            if (mounted) {
+                              setState(_recomputeLibrarySongs);
+                            }
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                  ValueListenableBuilder<Set<String>>(
+                    valueListenable:
+                        LibraryFilterSettings.instance.blacklistedFolders,
+                    builder: (context, folders, _) {
+                      return _buildSettingTile(
+                        icon: Icons.folder_off_outlined,
+                        title: 'Lista Negra de Carpetas',
+                        subtitle:
+                            '${folders.length} regla(s) activa(s) (ej. WhatsApp, Tonos)',
+                        trailing: Icon(
+                          Icons.chevron_right_rounded,
+                          color: LuminaColors.of(context).textTertiary,
+                        ),
+                        onTap: () => BlacklistFoldersSheet.show(
+                          context,
+                          detectedFolders: _detectedFolders,
+                          onChanged: () {
+                            if (mounted) {
+                              setState(_recomputeLibrarySongs);
+                            }
+                          },
+                        ),
+                      );
+                    },
+                  ),
                   _buildSettingTile(
                     icon: Icons.system_update_rounded,
                     title: 'Buscar Actualizaciones',
@@ -2335,6 +2524,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               Navigator.pop(context);
               setState(() {
                 _customMetadata.remove(song.id);
+                _recomputeLibrarySongs();
               });
               _saveCustomMetadata();
               _clearAudioHandlerMetadata(song);
@@ -2365,6 +2555,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                   'title': newTitle,
                   'artist': newArtist,
                 };
+                _recomputeLibrarySongs();
               });
               _saveCustomMetadata();
               _updateAudioHandlerMetadata(song);
@@ -2600,7 +2791,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  Widget _buildMusicCard(SongModel song, {bool isSelected = false}) {
+  Widget _buildMusicCard(
+    SongModel song, {
+    bool isSelected = false,
+    List<SongModel>? fromList,
+  }) {
     final colors = LuminaColors.of(context);
     final shapes = LuminaShapes.of(context);
     final isFav = _favoriteIds.contains(song.id);
@@ -2691,7 +2886,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         ),
         onTap: () {
           LuminaHaptics.fire(context, HapticEvent.select);
-          _playSong(song);
+          _playSong(song, fromList: fromList);
         },
       ),
     );
