@@ -21,7 +21,7 @@ permissions:
 jobs:
   build-and-release:
     name: Compilar APK y Publicar en GitHub
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Clonar código
@@ -36,6 +36,7 @@ jobs:
       - name: Configurar Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.38.9'
           channel: 'stable'
           cache: true
 
