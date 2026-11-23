@@ -567,8 +567,14 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     }
   }
 
-  Future<void> _playSong(SongModel song, {List<SongModel>? fromList}) async {
+  Future<void> _playSong(
+    SongModel song, {
+    List<SongModel>? fromList,
+    bool? shuffleEnabled,
+  }) async {
     final listToPlay = fromList ?? _songs;
+    if (listToPlay.isEmpty) return;
+
     final mediaItems = listToPlay
         .map(
           (s) => MediaItem(
@@ -586,23 +592,32 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         .toList();
 
     final index = listToPlay.indexWhere((s) => s.id == song.id);
+    final safeIndex = index != -1 ? index : 0;
 
-    await audioHandler.addQueueItems(mediaItems);
-    await audioHandler.skipToQueueItem(index != -1 ? index : 0);
-    audioHandler.play();
+    if (audioHandler is MyAudioHandler) {
+      await (audioHandler as MyAudioHandler).playFromList(
+        mediaItems,
+        initialIndex: safeIndex,
+        shuffleEnabled: shuffleEnabled,
+      );
+    } else {
+      await audioHandler.addQueueItems(mediaItems);
+      await audioHandler.skipToQueueItem(safeIndex);
+      await audioHandler.play();
+    }
   }
 
   void _playPlaylist(
     List<SongModel> playlistSongs, {
     bool shuffle = false,
-  }) async {
+  }) {
     if (playlistSongs.isEmpty) return;
-    if (shuffle) {
-      await audioHandler.setShuffleMode(AudioServiceShuffleMode.all);
-    } else {
-      await audioHandler.setShuffleMode(AudioServiceShuffleMode.none);
-    }
-    _playSong(playlistSongs[0], fromList: playlistSongs);
+    final startIndex = shuffle ? Random().nextInt(playlistSongs.length) : 0;
+    _playSong(
+      playlistSongs[startIndex],
+      fromList: playlistSongs,
+      shuffleEnabled: shuffle,
+    );
   }
 
   @override
