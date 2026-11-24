@@ -2,11 +2,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_video_progress_bar/audio_video_progress_bar.dart';
+import '../services/equalizer_settings.dart';
 import '../theme/lumina_colors.dart';
 import '../theme/lumina_haptics.dart';
 import '../theme/lumina_motion.dart';
 import '../theme/lumina_shapes.dart';
 import '../widgets/cached_artwork.dart';
+import '../widgets/equalizer_sheet.dart';
 import '../widgets/player_background.dart';
 import '../widgets/queue_bottom_sheet.dart';
 
@@ -38,6 +40,11 @@ class FullPlayerScreen extends StatefulWidget {
 class _FullPlayerScreenState extends State<FullPlayerScreen> {
   void _showQueueModal(BuildContext context) {
     QueueBottomSheet.show(context, widget.audioHandler);
+  }
+
+  void _showEqualizerModal(BuildContext context) {
+    LuminaHaptics.fire(context, HapticEvent.select);
+    EqualizerSheet.show(context);
   }
 
   @override
@@ -78,6 +85,7 @@ class _FullPlayerScreenState extends State<FullPlayerScreen> {
                             colors: colors,
                             constraints: constraints,
                             onShowQueue: () => _showQueueModal(context),
+                            onShowEqualizer: () => _showEqualizerModal(context),
                           );
                         }
 
@@ -90,6 +98,7 @@ class _FullPlayerScreenState extends State<FullPlayerScreen> {
                           colors: colors,
                           constraints: constraints,
                           onShowQueue: () => _showQueueModal(context),
+                          onShowEqualizer: () => _showEqualizerModal(context),
                         );
                       },
                     );
@@ -104,18 +113,20 @@ class _FullPlayerScreenState extends State<FullPlayerScreen> {
   }
 }
 
-/// Barra superior refinada con controles de minimizado y cola de reproducción
+/// Barra superior refinada con controles de minimizado, ecualizador y cola
 class _PlayerHeader extends StatelessWidget {
   final String? album;
   final LuminaColors colors;
   final VoidCallback onClose;
   final VoidCallback onShowQueue;
+  final VoidCallback onShowEqualizer;
 
   const _PlayerHeader({
     required this.album,
     required this.colors,
     required this.onClose,
     required this.onShowQueue,
+    required this.onShowEqualizer,
   });
 
   @override
@@ -161,14 +172,57 @@ class _PlayerHeader extends StatelessWidget {
             ],
           ),
         ),
-        IconButton(
-          icon: Icon(
-            Icons.queue_music_rounded,
-            size: 24,
-            color: colors.textPrimary,
-          ),
-          tooltip: 'Cola de reproducción',
-          onPressed: onShowQueue,
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ValueListenableBuilder<bool>(
+              valueListenable: EqualizerSettings.instance.enabled,
+              builder: (context, isEqEnabled, _) {
+                return IconButton(
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Icon(
+                        Icons.equalizer_rounded,
+                        size: 24,
+                        color: isEqEnabled
+                            ? colors.accent
+                            : colors.textPrimary,
+                      ),
+                      if (isEqEnabled)
+                        Positioned(
+                          right: -2,
+                          top: -2,
+                          child: Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              color: colors.accent,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  visualDensity: VisualDensity.compact,
+                  tooltip: isEqEnabled
+                      ? 'Ecualizador (activo)'
+                      : 'Ecualizador',
+                  onPressed: onShowEqualizer,
+                );
+              },
+            ),
+            IconButton(
+              icon: Icon(
+                Icons.queue_music_rounded,
+                size: 24,
+                color: colors.textPrimary,
+              ),
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Cola de reproducción',
+              onPressed: onShowQueue,
+            ),
+          ],
         ),
       ],
     );
@@ -772,6 +826,7 @@ class _PortraitPlayerLayout extends StatelessWidget {
   final LuminaColors colors;
   final BoxConstraints constraints;
   final VoidCallback onShowQueue;
+  final VoidCallback onShowEqualizer;
 
   const _PortraitPlayerLayout({
     required this.item,
@@ -782,6 +837,7 @@ class _PortraitPlayerLayout extends StatelessWidget {
     required this.colors,
     required this.constraints,
     required this.onShowQueue,
+    required this.onShowEqualizer,
   });
 
   @override
@@ -801,6 +857,7 @@ class _PortraitPlayerLayout extends StatelessWidget {
             colors: colors,
             onClose: () => Navigator.pop(context),
             onShowQueue: onShowQueue,
+            onShowEqualizer: onShowEqualizer,
           ),
           Center(
             child: _PlayerArtwork(
@@ -844,6 +901,7 @@ class _LandscapePlayerLayout extends StatelessWidget {
   final LuminaColors colors;
   final BoxConstraints constraints;
   final VoidCallback onShowQueue;
+  final VoidCallback onShowEqualizer;
 
   const _LandscapePlayerLayout({
     required this.item,
@@ -854,6 +912,7 @@ class _LandscapePlayerLayout extends StatelessWidget {
     required this.colors,
     required this.constraints,
     required this.onShowQueue,
+    required this.onShowEqualizer,
   });
 
   @override
@@ -890,6 +949,7 @@ class _LandscapePlayerLayout extends StatelessWidget {
                   colors: colors,
                   onClose: () => Navigator.pop(context),
                   onShowQueue: onShowQueue,
+                  onShowEqualizer: onShowEqualizer,
                 ),
                 _SongInfo(
                   title: item.title,

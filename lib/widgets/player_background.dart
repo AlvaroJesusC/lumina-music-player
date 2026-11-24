@@ -136,30 +136,28 @@ class _PlayerBackgroundState extends State<PlayerBackground>
         // Base oscura
         ColoredBox(color: colors.background),
 
-        // Minilámina de carátula estirada y atenuada (0 ms de raster blur)
-        Opacity(
-          opacity: 0.18,
-          child: CachedArtwork(
-            songId: widget.songId,
-            width: double.infinity,
-            height: double.infinity,
-            borderRadius: 0,
-            size: 60, // Tamaño muy pequeño para rendimiento instantáneo
-          ),
+        // Minilámina de carátula estirada sin Opacity/saveLayer offscreen
+        // (el velo degradado encima controla el ~18% de tinte ambiental).
+        CachedArtwork(
+          songId: widget.songId,
+          width: double.infinity,
+          height: double.infinity,
+          borderRadius: 0,
+          size: 60, // Tamaño muy pequeño para rendimiento instantáneo
         ),
 
-        // Velo de gradiente para contraste impecable de los controles
+        // Velo de gradiente para contraste impecable de los controles (sin blur)
         DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
               colors: [
-                colors.background.withValues(alpha: 0.60),
-                colors.background.withValues(alpha: 0.92),
+                colors.background.withValues(alpha: 0.82),
+                colors.background.withValues(alpha: 0.95),
                 colors.background,
               ],
-              stops: const [0.0, 0.6, 1.0],
+              stops: const [0.0, 0.58, 1.0],
             ),
           ),
         ),

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -23,6 +24,8 @@ import 'full_player_screen.dart';
 import '../widgets/queue_bottom_sheet.dart';
 import '../widgets/cached_artwork.dart';
 import '../widgets/dialogo_actualizacion.dart';
+import '../widgets/crossfade_settings_sheet.dart';
+import '../widgets/equalizer_sheet.dart';
 import '../widgets/library_filter_sheets.dart';
 import '../widgets/lumina_mini_player.dart';
 
@@ -111,13 +114,26 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   final List<SongModel> _allRawSongs = [];
   final Map<String, int> _detectedFolders = {};
   final List<SongModel> _songs = [];
+  List<SongModel> _cachedFilteredSongs = const [];
+  List<SongModel> _cachedFavoriteSongs = const [];
+  List<PlaylistModelCustom> _cachedFilteredPlaylists = const [];
   final Set<int> _favoriteIds = {};
   final Set<int> _hiddenSongIds = {};
   final List<PlaylistModelCustom> _playlists = [];
   PlaylistModelCustom? _selectedPlaylist;
   bool _isLoading = true;
-  String _searchQuery = "";
+  bool _permissionDenied = false;
+  bool _permissionPermanentlyDenied = false;
+  String _librarySearchQuery = "";
+  String _favoritesSearchQuery = "";
   String _playlistSearchQuery = "";
+  Timer? _searchDebounce;
+  final TextEditingController _librarySearchController =
+      TextEditingController();
+  final TextEditingController _favoritesSearchController =
+      TextEditingController();
+  final TextEditingController _playlistSearchController =
+      TextEditingController();
   RecentAddedFilter _recentFilter = RecentAddedFilter.all;
   final Map<int, Map<String, String>> _customMetadata = {};
   String _versionActual = '1.0.0';
@@ -126,14 +142,47 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   @override
   void initState() {
     super.initState();
-    // EJECUCIÓN SEGURA: Esperamos a que la Activity esté vinculada
+    // EJECUCIÓN SEGURA: Esperamos a que la Activity esté vinculada y cargamos
+    // primero las canciones ocultas antes de playlists/biblioteca para evitar
+    // condiciones de carrera.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadHiddenSongs();
-      _requestPermissions();
-      _loadFavorites();
-      _loadPlaylists();
-      _loadCustomMetadata();
-      _comprobarActualizacionesAlInicio();
+      unawaited(
+        _initializeLibraryData().catchError((Object e, StackTrace s) {
+          debugPrint('Error inicializando biblioteca: $e\n$s');
+        }),
+      );
+    });
+  }
+
+  Future<void> _initializeLibraryData() async {
+    await _loadHiddenSongs();
+    await Future.wait([
+      _loadFavorites(),
+      _loadPlaylists(),
+      _loadCustomMetadata(),
+    ]);
+    await _requestPermissions();
+    unawaited(
+      _comprobarActualizacionesAlInicio().catchError((Object e, StackTrace s) {
+        debugPrint('Error comprobando actualizaciones al inicio: $e\n$s');
+      }),
+    );
+  }
+
+  @override
+  void dispose() {
+    _searchDebounce?.cancel();
+    _librarySearchController.dispose();
+    _favoritesSearchController.dispose();
+    _playlistSearchController.dispose();
+    super.dispose();
+  }
+
+  void _scheduleSearchUpdate(VoidCallback applyQuery) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      setState(applyQuery);
     });
   }
 
@@ -252,11 +301,29 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       // 2. Pedir notificaciones
       await Permission.notification.request();
 
-      if (status[Permission.audio]!.isGranted ||
-          status[Permission.storage]!.isGranted) {
-        _loadSongs();
+      final hasAudioPermission = status[Permission.audio]?.isGranted ?? false;
+      final hasStoragePermission =
+          status[Permission.storage]?.isGranted ?? false;
+
+      if (hasAudioPermission || hasStoragePermission) {
+        if (mounted) {
+          setState(() {
+            _permissionDenied = false;
+            _permissionPermanentlyDenied = false;
+          });
+        }
+        await _loadSongs();
       } else {
-        if (mounted) setState(() => _isLoading = false);
+        final permanentlyDenied =
+            (status[Permission.audio]?.isPermanentlyDenied ?? false) ||
+            (status[Permission.storage]?.isPermanentlyDenied ?? false);
+        if (mounted) {
+          setState(() {
+            _permissionDenied = true;
+            _permissionPermanentlyDenied = permanentlyDenied;
+            _isLoading = false;
+          });
+        }
       }
     } catch (e) {
       debugPrint("Error en permisos: $e");
@@ -353,6 +420,51 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     _songs
       ..clear()
       ..addAll(filtered);
+    _recomputeFilteredSongs();
+    _recomputeFavoriteSongs();
+  }
+
+  void _recomputeFilteredSongs() {
+    final now = DateTime.now();
+    final query = _librarySearchQuery.trim().toLowerCase();
+    _cachedFilteredSongs = _songs.where((song) {
+      if (!LibraryFilterSettings.matchesRecentFilter(
+        song,
+        _recentFilter,
+        now,
+      )) {
+        return false;
+      }
+      if (query.isEmpty) return true;
+      final title = _getSongTitle(song).toLowerCase();
+      final artist = _getSongArtist(song).toLowerCase();
+      return title.contains(query) || artist.contains(query);
+    }).toList();
+  }
+
+  void _recomputeFavoriteSongs() {
+    final favorites = _songs.where((s) => _favoriteIds.contains(s.id));
+    final query = _favoritesSearchQuery.trim().toLowerCase();
+    if (query.isEmpty) {
+      _cachedFavoriteSongs = favorites.toList();
+      return;
+    }
+    _cachedFavoriteSongs = favorites.where((song) {
+      final title = _getSongTitle(song).toLowerCase();
+      final artist = _getSongArtist(song).toLowerCase();
+      return title.contains(query) || artist.contains(query);
+    }).toList();
+  }
+
+  void _recomputeFilteredPlaylists() {
+    final query = _playlistSearchQuery.trim().toLowerCase();
+    if (query.isEmpty) {
+      _cachedFilteredPlaylists = List<PlaylistModelCustom>.from(_playlists);
+      return;
+    }
+    _cachedFilteredPlaylists = _playlists
+        .where((p) => p.name.toLowerCase().contains(query))
+        .toList();
   }
 
   Future<void> _refreshLibrary() async {
@@ -372,44 +484,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     await _loadSongs();
   }
 
-  List<SongModel> get _filteredSongs {
-    final now = DateTime.now();
-    final query = _searchQuery.toLowerCase();
-    return _songs.where((song) {
-      if (!LibraryFilterSettings.matchesRecentFilter(
-        song,
-        _recentFilter,
-        now,
-      )) {
-        return false;
-      }
-      if (query.isEmpty) return true;
-      final title = _getSongTitle(song).toLowerCase();
-      final artist = _getSongArtist(song).toLowerCase();
-      return title.contains(query) || artist.contains(query);
-    }).toList();
-  }
+  List<SongModel> get _filteredSongs => _cachedFilteredSongs;
 
-  List<SongModel> get _favoriteSongs {
-    final favorites = _songs.where((s) => _favoriteIds.contains(s.id)).toList();
-    if (_searchQuery.isEmpty) return favorites;
-    final query = _searchQuery.toLowerCase();
-    return favorites.where((song) {
-      final title = _getSongTitle(song).toLowerCase();
-      final artist = _getSongArtist(song).toLowerCase();
-      return title.contains(query) || artist.contains(query);
-    }).toList();
-  }
+  List<SongModel> get _favoriteSongs => _cachedFavoriteSongs;
 
-  List<PlaylistModelCustom> get _filteredPlaylists {
-    if (_playlistSearchQuery.isEmpty) return _playlists;
-    return _playlists
-        .where(
-          (p) =>
-              p.name.toLowerCase().contains(_playlistSearchQuery.toLowerCase()),
-        )
-        .toList();
-  }
+  List<PlaylistModelCustom> get _filteredPlaylists => _cachedFilteredPlaylists;
 
   void _toggleFavorite(int songId) {
     setState(() {
@@ -418,6 +497,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       } else {
         _favoriteIds.add(songId);
       }
+      _recomputeFavoriteSongs();
     });
     _saveFavorites();
   }
@@ -429,6 +509,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       setState(() {
         _favoriteIds.clear();
         _favoriteIds.addAll(favorites.map((e) => int.parse(e)));
+        _recomputeFavoriteSongs();
       });
     } catch (e) {
       debugPrint("Error cargando favoritos: $e");
@@ -560,6 +641,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
               return playlist;
             }),
           );
+          _recomputeFilteredPlaylists();
         });
       }
     } catch (e) {
@@ -707,12 +789,41 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           children: [
             _buildHeader(onRefresh: _refreshLibrary),
             _buildSectionTitle('Tu Biblioteca', displaySongs.length),
-            _buildSearchBar(),
+            _buildSearchBar(
+              controller: _librarySearchController,
+              query: _librarySearchQuery,
+              hintText: 'Buscar en tu biblioteca...',
+              onChanged: (value) {
+                if (value.isEmpty) {
+                  _searchDebounce?.cancel();
+                  setState(() {
+                    _librarySearchQuery = '';
+                    _recomputeFilteredSongs();
+                  });
+                } else {
+                  _scheduleSearchUpdate(() {
+                    _librarySearchQuery = value;
+                    _recomputeFilteredSongs();
+                  });
+                }
+              },
+              onClear: () {
+                _searchDebounce?.cancel();
+                _librarySearchController.clear();
+                setState(() {
+                  _librarySearchQuery = '';
+                  _recomputeFilteredSongs();
+                });
+              },
+            ),
             LibraryFilterBar(
               activeRecentFilter: _recentFilter,
               activeSortOption: LibraryFilterSettings.instance.sortOption.value,
               onRecentFilterChanged: (filter) {
-                setState(() => _recentFilter = filter);
+                setState(() {
+                  _recentFilter = filter;
+                  _recomputeFilteredSongs();
+                });
               },
               onOpenSortSheet: () {
                 SortBottomSheet.show(
@@ -748,16 +859,22 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                               child: Column(
                                 children: [
                                   Icon(
-                                    _recentFilter != RecentAddedFilter.all
+                                    _permissionDenied
+                                        ? Icons.lock_open_rounded
+                                        : _recentFilter != RecentAddedFilter.all
                                         ? Icons.schedule_rounded
                                         : Icons.search_off_rounded,
                                     size: 56,
-                                    color: colors.textTertiary,
+                                    color: _permissionDenied
+                                        ? colors.accent
+                                        : colors.textTertiary,
                                   ),
                                   const SizedBox(height: 12),
                                   Text(
-                                    _searchQuery.isNotEmpty
-                                        ? 'Sin resultados para "$_searchQuery"'
+                                    _permissionDenied
+                                        ? 'Lumina necesita permiso de acceso a tu audio para mostrar tus canciones'
+                                        : _librarySearchQuery.trim().isNotEmpty
+                                        ? 'Sin resultados para "${_librarySearchQuery.trim()}"'
                                         : _recentFilter != RecentAddedFilter.all
                                         ? 'No hay canciones añadidas en ${_recentFilter.label.toLowerCase()}'
                                         : 'No se encontró música',
@@ -768,8 +885,88 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                                       fontWeight: FontWeight.w500,
                                     ),
                                   ),
-                                  if (_recentFilter != RecentAddedFilter.all &&
-                                      _searchQuery.isEmpty) ...[
+                                  if (_permissionDenied) ...[
+                                    const SizedBox(height: 16),
+                                    ElevatedButton.icon(
+                                      onPressed: () {
+                                        LuminaHaptics.fire(
+                                          context,
+                                          HapticEvent.select,
+                                        );
+                                        if (_permissionPermanentlyDenied) {
+                                          unawaited(
+                                            openAppSettings().catchError((
+                                              Object e,
+                                              StackTrace s,
+                                            ) {
+                                              debugPrint(
+                                                'Error abriendo ajustes: $e\n$s',
+                                              );
+                                              return false;
+                                            }),
+                                          );
+                                        } else {
+                                          setState(() => _isLoading = true);
+                                          unawaited(
+                                            _requestPermissions().catchError((
+                                              Object e,
+                                              StackTrace s,
+                                            ) {
+                                              debugPrint(
+                                                'Error solicitando permisos: $e\n$s',
+                                              );
+                                            }),
+                                          );
+                                        }
+                                      },
+                                      icon: Icon(
+                                        _permissionPermanentlyDenied
+                                            ? Icons.settings_outlined
+                                            : Icons.verified_user_outlined,
+                                        size: 18,
+                                      ),
+                                      label: Text(
+                                        _permissionPermanentlyDenied
+                                            ? 'Abrir ajustes de Android'
+                                            : 'Conceder permiso',
+                                      ),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: colors.accent,
+                                        foregroundColor: colors.onAccent,
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius:
+                                              BorderRadius.circular(12),
+                                        ),
+                                      ),
+                                    ),
+                                    if (_permissionPermanentlyDenied) ...[
+                                      const SizedBox(height: 8),
+                                      TextButton(
+                                        onPressed: () {
+                                          setState(() => _isLoading = true);
+                                          unawaited(
+                                            _requestPermissions().catchError((
+                                              Object e,
+                                              StackTrace s,
+                                            ) {
+                                              debugPrint(
+                                                'Error reintentando permisos: $e\n$s',
+                                              );
+                                            }),
+                                          );
+                                        },
+                                        child: Text(
+                                          'Ya concedí el permiso — Reintentar',
+                                          style: TextStyle(
+                                            color: colors.accentInk,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ] else if (_recentFilter !=
+                                          RecentAddedFilter.all &&
+                                      _librarySearchQuery.trim().isEmpty) ...[
                                     const SizedBox(height: 12),
                                     TextButton.icon(
                                       onPressed: () {
@@ -777,10 +974,10 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                                           context,
                                           HapticEvent.select,
                                         );
-                                        setState(
-                                          () => _recentFilter =
-                                              RecentAddedFilter.all,
-                                        );
+                                        setState(() {
+                                          _recentFilter = RecentAddedFilter.all;
+                                          _recomputeFilteredSongs();
+                                        });
                                       },
                                       icon: Icon(
                                         Icons.library_music_rounded,
@@ -850,7 +1047,33 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           children: [
             _buildHeader(),
             _buildSectionTitle('Favoritos', favorites.length),
-            _buildSearchBar(),
+            _buildSearchBar(
+              controller: _favoritesSearchController,
+              query: _favoritesSearchQuery,
+              hintText: 'Buscar en favoritos...',
+              onChanged: (value) {
+                if (value.isEmpty) {
+                  _searchDebounce?.cancel();
+                  setState(() {
+                    _favoritesSearchQuery = '';
+                    _recomputeFavoriteSongs();
+                  });
+                } else {
+                  _scheduleSearchUpdate(() {
+                    _favoritesSearchQuery = value;
+                    _recomputeFavoriteSongs();
+                  });
+                }
+              },
+              onClear: () {
+                _searchDebounce?.cancel();
+                _favoritesSearchController.clear();
+                setState(() {
+                  _favoritesSearchQuery = '';
+                  _recomputeFavoriteSongs();
+                });
+              },
+            ),
             const SizedBox(height: 20),
             Expanded(
               child: favorites.isEmpty
@@ -865,7 +1088,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                           ),
                           const SizedBox(height: 10),
                           Text(
-                            _searchQuery.isEmpty
+                            _favoritesSearchQuery.trim().isEmpty
                                 ? "Aún no tienes favoritos"
                                 : "Sin resultados en favoritos",
                             style: TextStyle(color: Colors.grey[600]),
@@ -962,35 +1185,32 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Widget _buildPlaylistSearchBar() {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 15),
-        decoration: BoxDecoration(
-          color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[100],
-          borderRadius: BorderRadius.circular(25),
-        ),
-        child: TextField(
-          onChanged: (value) => setState(() => _playlistSearchQuery = value),
-          style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
-          decoration: InputDecoration(
-            hintText: 'Buscar en mis listas...',
-            hintStyle: TextStyle(
-              color: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.3),
-            ),
-            border: InputBorder.none,
-            icon: Icon(
-              Icons.search,
-              color: Theme.of(
-                context,
-              ).colorScheme.onSurface.withValues(alpha: 0.3),
-            ),
-          ),
-        ),
-      ),
+    return _buildSearchBar(
+      controller: _playlistSearchController,
+      query: _playlistSearchQuery,
+      hintText: 'Buscar en mis listas...',
+      onChanged: (value) {
+        if (value.isEmpty) {
+          _searchDebounce?.cancel();
+          setState(() {
+            _playlistSearchQuery = '';
+            _recomputeFilteredPlaylists();
+          });
+        } else {
+          _scheduleSearchUpdate(() {
+            _playlistSearchQuery = value;
+            _recomputeFilteredPlaylists();
+          });
+        }
+      },
+      onClear: () {
+        _searchDebounce?.cancel();
+        _playlistSearchController.clear();
+        setState(() {
+          _playlistSearchQuery = '';
+          _recomputeFilteredPlaylists();
+        });
+      },
     );
   }
 
@@ -1067,8 +1287,87 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final borderRadius = BorderRadius.circular(30);
 
-    // Si hay portada personalizada, mostrarla primero
-    if (playlist.coverPath != null && File(playlist.coverPath!).existsSync()) {
+    Widget buildFallbackCover() {
+      if (playlist.songs.isEmpty) {
+        return Container(
+          decoration: BoxDecoration(
+            color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[200],
+            borderRadius: borderRadius,
+          ),
+          child: Icon(
+            Icons.music_note_rounded,
+            size: 50,
+            color: colorScheme.primary.withValues(alpha: 0.5),
+          ),
+        );
+      }
+
+      if (playlist.songs.length == 1 ||
+          playlist.name.toLowerCase().contains("favoritos")) {
+        return CachedArtwork(
+          songId: playlist.songs[0].id,
+          borderRadius: 24,
+          size: 250,
+        );
+      }
+
+      return Container(
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[200],
+          borderRadius: borderRadius,
+        ),
+        padding: const EdgeInsets.all(6),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: GridView.builder(
+            physics: const NeverScrollableScrollPhysics(),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              crossAxisSpacing: 6,
+              mainAxisSpacing: 6,
+            ),
+            itemCount: 4,
+            itemBuilder: (context, i) {
+              if (i < playlist.songs.length) {
+                if (i == 3 && playlist.songs.length > 4) {
+                  return Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF252A34),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Center(
+                      child: Text(
+                        '+${playlist.songs.length - 3}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ),
+                  );
+                }
+                return CachedArtwork(
+                  songId: playlist.songs[i].id,
+                  borderRadius: 10,
+                  size: 150,
+                );
+              }
+              return Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFF252A34).withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              );
+            },
+          ),
+        ),
+      );
+    }
+
+    // Sin I/O síncrono (`existsSync`) en build(); decodificación acotada a 420 px
+    // y fallback automático si el archivo dejó de existir.
+    if (playlist.coverPath != null && playlist.coverPath!.isNotEmpty) {
       return ClipRRect(
         borderRadius: borderRadius,
         child: Image.file(
@@ -1076,85 +1375,15 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           fit: BoxFit.cover,
           width: double.infinity,
           height: double.infinity,
+          cacheWidth: 420,
+          cacheHeight: 420,
+          gaplessPlayback: true,
+          errorBuilder: (_, _, _) => buildFallbackCover(),
         ),
       );
     }
 
-    if (playlist.songs.isEmpty) {
-      return Container(
-        decoration: BoxDecoration(
-          color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[200],
-          borderRadius: borderRadius,
-        ),
-        child: Icon(
-          Icons.music_note_rounded,
-          size: 50,
-          color: colorScheme.primary.withValues(alpha: 0.5),
-        ),
-      );
-    }
-
-    if (playlist.songs.length == 1 ||
-        playlist.name.toLowerCase().contains("favoritos")) {
-      return CachedArtwork(
-        songId: playlist.songs[0].id,
-        borderRadius: 24,
-        size: 250,
-      );
-    }
-
-    return Container(
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1A1A1A) : Colors.grey[200],
-        borderRadius: borderRadius,
-      ),
-      padding: const EdgeInsets.all(6),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(24),
-        child: GridView.builder(
-          physics: const NeverScrollableScrollPhysics(),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            crossAxisSpacing: 6,
-            mainAxisSpacing: 6,
-          ),
-          itemCount: 4,
-          itemBuilder: (context, i) {
-            if (i < playlist.songs.length) {
-              if (i == 3 && playlist.songs.length > 4) {
-                return Container(
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF252A34),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Center(
-                    child: Text(
-                      '+${playlist.songs.length - 3}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16,
-                      ),
-                    ),
-                  ),
-                );
-              }
-              return CachedArtwork(
-                songId: playlist.songs[i].id,
-                borderRadius: 10,
-                size: 150,
-              );
-            }
-            return Container(
-              decoration: BoxDecoration(
-                color: const Color(0xFF252A34).withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(10),
-              ),
-            );
-          },
-        ),
-      ),
-    );
+    return buildFallbackCover();
   }
 
   String _getPlaylistDuration(List<SongModel> songs) {
@@ -1166,30 +1395,37 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
   }
 
   Widget _buildHeaderCollage(PlaylistModelCustom playlist) {
-    // Si hay portada personalizada, mostrarla en lugar del collage
-    if (playlist.coverPath != null && File(playlist.coverPath!).existsSync()) {
+    Widget buildFallbackCollage() {
+      if (playlist.songs.isEmpty) return Container(color: Colors.grey[900]);
+
+      return GridView.builder(
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+        ),
+        itemCount: min(playlist.songs.length, 4),
+        itemBuilder: (context, i) => CachedArtwork(
+          songId: playlist.songs[i].id,
+          borderRadius: 0,
+          size: 150,
+        ),
+      );
+    }
+
+    if (playlist.coverPath != null && playlist.coverPath!.isNotEmpty) {
       return Image.file(
         File(playlist.coverPath!),
         fit: BoxFit.cover,
         width: double.infinity,
         height: double.infinity,
+        cacheWidth: 720,
+        cacheHeight: 720,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => buildFallbackCollage(),
       );
     }
 
-    if (playlist.songs.isEmpty) return Container(color: Colors.grey[900]);
-
-    return GridView.builder(
-      physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-      ),
-      itemCount: min(playlist.songs.length, 4),
-      itemBuilder: (context, i) => CachedArtwork(
-        songId: playlist.songs[i].id,
-        borderRadius: 0,
-        size: 150,
-      ),
-    );
+    return buildFallbackCollage();
   }
 
   Widget _buildCircleButton({
@@ -1320,22 +1556,22 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             left: 0,
             right: 0,
             height: 400,
-            child: Opacity(opacity: 0.7, child: _buildHeaderCollage(playlist)),
+            child: _buildHeaderCollage(playlist),
           ),
           Positioned(
             top: 0,
             left: 0,
             right: 0,
             height: 400,
-            child: Container(
+            child: DecoratedBox(
               decoration: BoxDecoration(
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: [
                     isDark
-                        ? const Color(0xFF0A0A0A).withValues(alpha: 0.6)
-                        : Colors.white.withValues(alpha: 0.6),
+                        ? const Color(0xFF0A0A0A).withValues(alpha: 0.72)
+                        : Colors.white.withValues(alpha: 0.72),
                     isDark ? const Color(0xFF0A0A0A) : Colors.white,
                   ],
                   stops: const [0.0, 0.9],
@@ -1557,9 +1793,21 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
+  void _disposeControllersAfterDialog(
+    List<TextEditingController> controllers,
+  ) {
+    unawaited(
+      Future<void>.delayed(const Duration(milliseconds: 350), () {
+        for (final c in controllers) {
+          c.dispose();
+        }
+      }),
+    );
+  }
+
   void _renamePlaylist(PlaylistModelCustom playlist) {
     final controller = TextEditingController(text: playlist.name);
-    showDialog(
+    showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Renombrar lista'),
@@ -1575,9 +1823,11 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           ),
           TextButton(
             onPressed: () {
-              if (controller.text.isNotEmpty) {
+              final trimmed = controller.text.trim();
+              if (trimmed.isNotEmpty) {
                 setState(() {
-                  playlist.name = controller.text;
+                  playlist.name = trimmed;
+                  _recomputeFilteredPlaylists();
                 });
                 _savePlaylists();
                 Navigator.pop(context);
@@ -1587,7 +1837,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           ),
         ],
       ),
-    );
+    ).whenComplete(() => _disposeControllersAfterDialog([controller]));
   }
 
   void _changePlaylistCover(PlaylistModelCustom playlist) async {
@@ -1610,6 +1860,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
             if (_selectedPlaylist?.id == playlist.id) {
               _selectedPlaylist = _playlists[index];
             }
+            _recomputeFilteredPlaylists();
           }
         });
         _savePlaylists();
@@ -1723,12 +1974,28 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                             child: ClipRRect(
                               borderRadius: BorderRadius.circular(12),
                               child: localCoverPath != null &&
-                                      File(localCoverPath!).existsSync()
+                                      localCoverPath!.isNotEmpty
                                   ? Image.file(
                                       File(localCoverPath!),
                                       fit: BoxFit.cover,
                                       width: 110,
                                       height: 110,
+                                      cacheWidth: 260,
+                                      cacheHeight: 260,
+                                      gaplessPlayback: true,
+                                      errorBuilder: (_, _, _) =>
+                                          playlist.songs.isEmpty
+                                          ? Icon(
+                                              Icons.music_note_rounded,
+                                              size: 44,
+                                              color: const Color(
+                                                0xFF4CAF50,
+                                              ).withValues(alpha: 0.6),
+                                            )
+                                          : _buildDialogCollage(
+                                              playlist,
+                                              isDark,
+                                            ),
                                     )
                                   : playlist.songs.isEmpty
                                   ? Icon(
@@ -1833,6 +2100,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       if (_selectedPlaylist?.id == playlist.id) {
                         _selectedPlaylist = _playlists[index];
                       }
+                      _recomputeFilteredPlaylists();
                     }
                   });
                   _savePlaylists();
@@ -1849,7 +2117,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           );
         },
       ),
-    );
+    ).whenComplete(() => _disposeControllersAfterDialog([nameController]));
   }
 
   void _openAddSongsToPlaylist(PlaylistModelCustom playlist) async {
@@ -1859,6 +2127,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         builder: (context) => AddSongsScreen(
           allSongs: _songs,
           currentPlaylistSongs: playlist.songs,
+          customMetadata: _customMetadata,
         ),
       ),
     );
@@ -1879,6 +2148,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         builder: (context) => CreatePlaylistScreen(
           availableSongs: _songs,
           defaultName: defaultName,
+          customMetadata: _customMetadata,
         ),
       ),
     );
@@ -1886,6 +2156,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     if (result != null && result is PlaylistModelCustom) {
       setState(() {
         _playlists.add(result);
+        _recomputeFilteredPlaylists();
       });
       _savePlaylists();
     }
@@ -1898,6 +2169,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         builder: (context) => CreatePlaylistScreen(
           availableSongs: _songs,
           initialPlaylist: playlist,
+          customMetadata: _customMetadata,
         ),
       ),
     );
@@ -1910,6 +2182,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           if (_selectedPlaylist?.id == playlist.id) {
             _selectedPlaylist = result;
           }
+          _recomputeFilteredPlaylists();
         }
       });
       _savePlaylists();
@@ -1934,6 +2207,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 if (_selectedPlaylist?.id == playlist.id) {
                   _selectedPlaylist = null;
                 }
+                _recomputeFilteredPlaylists();
               });
               _savePlaylists();
               Navigator.pop(context);
@@ -2068,6 +2342,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                       );
                     },
                   ),
+                  const CrossfadeSettingsTile(),
+                  const EqualizerSettingsTile(),
                   ValueListenableBuilder<MinDurationFilter>(
                     valueListenable: LibraryFilterSettings.instance.minDuration,
                     builder: (context, minDur, _) {
@@ -2591,6 +2867,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           ),
         ],
       ),
+    ).whenComplete(
+      () => _disposeControllersAfterDialog([titleController, artistController]),
     );
   }
 
@@ -2675,6 +2953,7 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
         builder: (context) => CreatePlaylistScreen(
           availableSongs: _songs,
           defaultName: defaultName,
+          customMetadata: _customMetadata,
         ),
       ),
     );
@@ -2685,13 +2964,22 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
       }
       setState(() {
         _playlists.add(result);
+        _recomputeFilteredPlaylists();
       });
       _savePlaylists();
       if (!mounted) return;
+      final colors = LuminaColors.of(context);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Lista creada y canción agregada'),
-          backgroundColor: Color.fromARGB(255, 255, 255, 255),
+        SnackBar(
+          content: Text(
+            'Lista creada y canción agregada',
+            style: TextStyle(
+              color: colors.onAccent,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: colors.accent,
         ),
       );
     }
@@ -2782,6 +3070,8 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
                 for (final p in _playlists) {
                   p.songs.removeWhere((s) => s.id == song.id);
                 }
+                _recomputeFilteredSongs();
+                _recomputeFavoriteSongs();
               });
               _saveHiddenSongs();
               _savePlaylists();
@@ -3044,7 +3334,13 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
     );
   }
 
-  Widget _buildSearchBar() {
+  Widget _buildSearchBar({
+    required TextEditingController controller,
+    required String query,
+    required String hintText,
+    required ValueChanged<String> onChanged,
+    required VoidCallback onClear,
+  }) {
     final colors = LuminaColors.of(context);
     final shapes = LuminaShapes.of(context);
     return Padding(
@@ -3057,16 +3353,28 @@ class _MusicLibraryPageState extends State<MusicLibraryPage> {
           border: Border.all(color: colors.hairline, width: 1),
         ),
         child: TextField(
-          onChanged: (value) => setState(() => _searchQuery = value),
+          controller: controller,
+          onChanged: onChanged,
           style: TextStyle(color: colors.textPrimary),
           decoration: InputDecoration(
-            hintText: 'Buscar...',
+            hintText: hintText,
             hintStyle: TextStyle(color: colors.textTertiary),
             border: InputBorder.none,
             icon: Icon(
               Icons.search_rounded,
               color: colors.textSecondary,
             ),
+            suffixIcon: query.isNotEmpty
+                ? IconButton(
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 18,
+                      color: colors.textSecondary,
+                    ),
+                    tooltip: 'Limpiar búsqueda',
+                    onPressed: onClear,
+                  )
+                : null,
           ),
         ),
       ),

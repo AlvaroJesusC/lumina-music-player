@@ -6,8 +6,8 @@ import 'package:lumina_player/theme/lumina_haptics.dart';
 import 'package:lumina_player/theme/lumina_motion.dart';
 import 'package:lumina_player/theme/lumina_shapes.dart';
 import 'package:lumina_player/theme/lumina_theme.dart';
-
 import 'package:lumina_player/widgets/player_background.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   group('Lumina Theme Tests', () {
@@ -40,6 +40,23 @@ void main() {
       expect(PlayerBackgroundStyle.parse('animated'), PlayerBackgroundStyle.animated);
       expect(PlayerBackgroundStyle.parse('unknown_corrupt_data'), PlayerBackgroundStyle.ambient);
       expect(PlayerBackgroundStyle.parse(null), PlayerBackgroundStyle.ambient);
+    });
+
+    test('AppearanceSettings persists light and dark ThemeMode across loads', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final settings = AppearanceSettings.instance;
+      await settings.load();
+      expect(settings.themeMode.value, ThemeMode.dark);
+
+      await settings.setThemeMode(ThemeMode.light);
+      expect(settings.themeMode.value, ThemeMode.light);
+
+      // Re-cargar desde SharedPreferences para confirmar persistencia real
+      settings.themeMode.value = ThemeMode.dark;
+      await settings.load();
+      expect(settings.themeMode.value, ThemeMode.light);
+
+      await settings.setThemeMode(ThemeMode.dark);
     });
 
     testWidgets('PlayerBackground mounts cleanly with animated style without MediaQuery errors', (tester) async {

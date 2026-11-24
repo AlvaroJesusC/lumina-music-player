@@ -3,6 +3,9 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_service/audio_service.dart';
+import 'crossfade_engine.dart';
+import 'equalizer_engine.dart';
+import 'sleep_timer_service.dart';
 
 /// Orden de aleatoriedad personalizado que respeta las canciones añadidas por
 /// el usuario a la cola de reproducción y permite reordenar la fila en modo
@@ -134,9 +137,15 @@ class QueueAwareShuffleOrder extends ShuffleOrder {
 class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   static const String _queueUidExtraKey = 'queueUid';
 
-  final _player = AudioPlayer();
+  late final EqualizerEngine _equalizerEngine;
+  late final AudioPlayer _player;
   late final ConcatenatingAudioSource _playlist;
   late final QueueAwareShuffleOrder _shuffleOrder;
+  late final CrossfadeEngine _crossfadeEngine;
+
+  /// Frecuencias centrales de las bandas del ecualizador del dispositivo.
+  ValueListenable<List<double>> get equalizerCenterFrequencies =>
+      _equalizerEngine.centerFrequenciesHz;
 
   // Identidad única de cada entrada en la cola (incluso si se repite una canción)
   int _nextQueueUid = 1;
@@ -203,12 +212,22 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   MyAudioHandler() {
+    _equalizerEngine = EqualizerEngine();
+    _player = AudioPlayer(audioPipeline: _equalizerEngine.pipeline);
     _shuffleOrder = QueueAwareShuffleOrder(
       getPreservedUpcomingIndices: _getContiguousUserQueuedActualIndices,
     );
     _playlist = ConcatenatingAudioSource(
       children: [],
       shuffleOrder: _shuffleOrder,
+    );
+    _crossfadeEngine = CrossfadeEngine(
+      primaryPlayer: _player,
+      resolveCurrentTrackUri: _resolveCurrentTrackUri,
+      resolveCurrentTrackKey: _resolveCurrentTrackKey,
+      canAdvanceToNext: () => _playlist.length > 1,
+      advanceToNext: _advanceTrackForCrossfade,
+      isCrossfadeSuppressed: () => SleepTimerService.instance.isStopAtEndOfSong,
     );
     unawaited(
       _initPlayer().catchError((Object e, StackTrace s) {
@@ -323,6 +342,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> _initPlayer() async {
     try {
       await _player.setAudioSource(_playlist);
+      _equalizerEngine.attachToActivePlayer();
       await _player.setLoopMode(LoopMode.all);
       _notifyAudioHandlerAboutPlaybackEvents();
       _listenForSequenceStateChanges();
@@ -529,6 +549,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }) {
     return _enqueueOp(() async {
       if (mediaItems.isEmpty) return;
+      await _crossfadeEngine.cancelActiveTransition();
 
       final safeIndex = initialIndex.clamp(0, mediaItems.length - 1);
       await _loadQueueItemsInternal(mediaItems);
@@ -554,7 +575,14 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       }
 
       _bumpQueueRevision();
-      await _player.play();
+      // IMPORTANTE: en just_audio, `_player.play()` solo completa al pausar o
+      // terminar la reproducción. No hacer `await` dentro de `_enqueueOp` para
+      // no bloquear operaciones posteriores de cola, shuffle o cambio de pista.
+      unawaited(
+        _player.play().catchError((Object e, StackTrace s) {
+          debugPrint('Error iniciando reproducción en playFromList: $e\n$s');
+        }),
+      );
     });
   }
 
@@ -582,6 +610,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
         // Si el reproductor está vacío o no se ha iniciado:
         if (_playlist.length == 0 || currentActual == null) {
+          await _crossfadeEngine.cancelActiveTransition();
           _shuffleOrder.pendingInsertShufflePos = null;
           _userQueuedUids.clear();
           _currentPlaylistIds = [taggedItem.id];
@@ -590,7 +619,13 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           await _player.seek(Duration.zero, index: 0);
           super.mediaItem.add(_applyOverride(taggedItem));
           _bumpQueueRevision();
-          await _player.play();
+          unawaited(
+            _player.play().catchError((Object e, StackTrace s) {
+              debugPrint(
+                'Error iniciando reproducción desde addQueueItem: $e\n$s',
+              );
+            }),
+          );
           return;
         }
 
@@ -848,17 +883,31 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     return indices.indexOf(currentIdx);
   }
 
-  @override
-  Future<void> play() => _player.play();
+  Uri? _resolveCurrentTrackUri() {
+    final idx = _resolveCurrentActualIndex();
+    if (idx == null || idx < 0 || idx >= _playlist.children.length) return null;
+    final source = _playlist.children[idx];
+    if (source is IndexedAudioSource && source.tag is MediaItem) {
+      final item = source.tag as MediaItem;
+      final url = item.extras?['url']?.toString() ?? '';
+      if (url.isEmpty) return null;
+      return _resolveUri(url);
+    }
+    return null;
+  }
 
-  @override
-  Future<void> pause() => _player.pause();
+  String? _resolveCurrentTrackKey() {
+    if (_currentPlayingUid != null) return _currentPlayingUid;
+    final idx = _resolveCurrentActualIndex();
+    if (idx == null || idx < 0 || idx >= _playlist.children.length) return null;
+    final source = _playlist.children[idx];
+    if (source is IndexedAudioSource && source.tag is MediaItem) {
+      return (source.tag as MediaItem).id;
+    }
+    return null;
+  }
 
-  @override
-  Future<void> seek(Duration position) => _player.seek(position);
-
-  @override
-  Future<void> skipToNext() async {
+  Future<void> _advanceTrackForCrossfade() async {
     if (_playlist.length == 0) return;
     if (_player.hasNext) {
       await _player.seekToNext();
@@ -871,9 +920,40 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     }
   }
 
+  /// Aplica el factor de atenuación `[0.0, 1.0]` del temporizador de apagado.
+  Future<void> setSleepTimerVolumeFactor(double factor) =>
+      _crossfadeEngine.setSleepTimerVolumeFactor(factor);
+
+  /// Pausa la reproducción al finalizar la bajada progresiva del temporizador.
+  Future<void> pauseFromSleepTimer() => _crossfadeEngine.pauseFromSleepTimer();
+
+  /// Restaura suavemente el volumen si el usuario cancela el temporizador.
+  Future<void> restoreSleepTimerVolume() =>
+      _crossfadeEngine.restoreSleepTimerVolume();
+
+  @override
+  Future<void> play() => _crossfadeEngine.playWithFade();
+
+  @override
+  Future<void> pause() => _crossfadeEngine.pauseWithFade();
+
+  @override
+  Future<void> seek(Duration position) async {
+    await _crossfadeEngine.cancelActiveTransition();
+    await _player.seek(position);
+  }
+
+  @override
+  Future<void> skipToNext() async {
+    if (_playlist.length == 0) return;
+    await _crossfadeEngine.cancelActiveTransition();
+    await _advanceTrackForCrossfade();
+  }
+
   @override
   Future<void> skipToPrevious() async {
     if (_playlist.length == 0) return;
+    await _crossfadeEngine.cancelActiveTransition();
     if (_player.hasPrevious) {
       await _player.seekToPrevious();
     } else {
@@ -904,6 +984,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> skipToQueueItem(int index) {
     return _enqueueOp(() async {
       if (index < 0 || index >= _playlist.length) return;
+      await _crossfadeEngine.cancelActiveTransition();
       final targetUid = _queueUidOfSource(_playlist.children[index]);
       if (targetUid != null) {
         _currentPlayingUid = targetUid;
@@ -916,6 +997,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   @override
   Future<void> stop() async {
+    await _crossfadeEngine.cancelActiveTransition();
     await _player.stop();
     return super.stop();
   }
@@ -928,6 +1010,8 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   Future<void> dispose() async {
+    await _crossfadeEngine.dispose();
+    _equalizerEngine.dispose();
     await _currentIndexSub?.cancel();
     await _playbackEventSub?.cancel();
     await _shuffleModeSub?.cancel();

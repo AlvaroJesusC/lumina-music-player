@@ -1,16 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:on_audio_query/on_audio_query.dart';
+import '../theme/lumina_colors.dart';
+import '../theme/lumina_shapes.dart';
 import '../widgets/cached_artwork.dart';
 
 /// Pantalla para añadir canciones a una lista de reproducción existente.
 class AddSongsScreen extends StatefulWidget {
   final List<SongModel> allSongs;
   final List<SongModel> currentPlaylistSongs;
+  final Map<int, Map<String, String>> customMetadata;
 
   const AddSongsScreen({
     super.key,
     required this.allSongs,
     required this.currentPlaylistSongs,
+    this.customMetadata = const {},
   });
 
   @override
@@ -19,6 +23,8 @@ class AddSongsScreen extends StatefulWidget {
 
 class _AddSongsScreenState extends State<AddSongsScreen> {
   final List<SongModel> _selectedToAdd = [];
+  final Set<int> _selectedIds = {};
+  final TextEditingController _searchController = TextEditingController();
   late List<SongModel> _notAddedSongs;
   String _searchQuery = '';
 
@@ -32,9 +38,37 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
   }
 
   @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  String _titleOf(SongModel song) =>
+      widget.customMetadata[song.id]?['title'] ?? song.title;
+
+  String _artistOf(SongModel song) =>
+      widget.customMetadata[song.id]?['artist'] ?? song.artist ?? 'Desconocido';
+
+  void _toggleSong(SongModel song, bool selected) {
+    setState(() {
+      if (selected) {
+        if (_selectedIds.add(song.id)) {
+          _selectedToAdd.add(song);
+        }
+      } else {
+        _selectedIds.remove(song.id);
+        _selectedToAdd.removeWhere((s) => s.id == song.id);
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final colors = LuminaColors.of(context);
+    final shapes = LuminaShapes.of(context);
+
     return Scaffold(
-      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      backgroundColor: colors.background,
       appBar: AppBar(
         title: const Text(
           'Añadir canciones',
@@ -45,10 +79,12 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, _selectedToAdd),
-            child: const Text(
-              'LISTO',
+            child: Text(
+              _selectedToAdd.isEmpty
+                  ? 'LISTO'
+                  : 'LISTO (${_selectedToAdd.length})',
               style: TextStyle(
-                color: Color(0xFF4CAF50),
+                color: colors.accentInk,
                 fontWeight: FontWeight.bold,
               ),
             ),
@@ -62,47 +98,62 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 15),
               decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                borderRadius: BorderRadius.circular(20),
+                color: colors.surfaceHighest,
+                borderRadius: BorderRadius.circular(shapes.field),
+                border: Border.all(color: colors.hairline),
               ),
               child: TextField(
+                controller: _searchController,
                 onChanged: (value) => setState(() => _searchQuery = value),
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSurface,
-                ),
+                style: TextStyle(color: colors.textPrimary),
                 decoration: InputDecoration(
                   hintText: 'Buscar canción...',
-                  hintStyle: TextStyle(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withValues(alpha: 0.5),
-                  ),
+                  hintStyle: TextStyle(color: colors.textTertiary),
                   border: InputBorder.none,
-                  icon: Icon(
-                    Icons.search,
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.onSurface.withValues(alpha: 0.5),
-                  ),
+                  icon: Icon(Icons.search_rounded, color: colors.textSecondary),
+                  suffixIcon: _searchQuery.isNotEmpty
+                      ? IconButton(
+                          icon: Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: colors.textSecondary,
+                          ),
+                          tooltip: 'Limpiar búsqueda',
+                          onPressed: () {
+                            _searchController.clear();
+                            setState(() => _searchQuery = '');
+                          },
+                        )
+                      : null,
                 ),
               ),
             ),
           ),
           Expanded(
             child: _notAddedSongs.isEmpty
-                ? const Center(child: Text("No hay más canciones para añadir"))
+                ? Center(
+                    child: Text(
+                      'No hay más canciones para añadir',
+                      style: TextStyle(color: colors.textSecondary),
+                    ),
+                  )
                 : Builder(
                     builder: (context) {
-                      final filteredSongs = _searchQuery.isEmpty
+                      final q = _searchQuery.trim().toLowerCase();
+                      final filteredSongs = q.isEmpty
                           ? _notAddedSongs
                           : _notAddedSongs.where((s) {
-                              final q = _searchQuery.toLowerCase();
-                              return s.title.toLowerCase().contains(q) ||
-                                  (s.artist ?? "").toLowerCase().contains(q);
+                              return _titleOf(s).toLowerCase().contains(q) ||
+                                  _artistOf(s).toLowerCase().contains(q);
                             }).toList();
 
                       if (filteredSongs.isEmpty) {
-                        return const Center(child: Text("Sin resultados"));
+                        return Center(
+                          child: Text(
+                            'Sin resultados',
+                            style: TextStyle(color: colors.textSecondary),
+                          ),
+                        );
                       }
 
                       return ListView.builder(
@@ -111,25 +162,24 @@ class _AddSongsScreenState extends State<AddSongsScreen> {
                         itemCount: filteredSongs.length,
                         itemBuilder: (context, index) {
                           final song = filteredSongs[index];
-                          final isSelected = _selectedToAdd.contains(song);
+                          final isSelected = _selectedIds.contains(song.id);
                           return CheckboxListTile(
                             value: isSelected,
-                            activeColor: const Color(0xFF4CAF50),
-                            onChanged: (val) {
-                              setState(() {
-                                if (val == true) {
-                                  _selectedToAdd.add(song);
-                                } else {
-                                  _selectedToAdd.remove(song);
-                                }
-                              });
-                            },
+                            activeColor: colors.accent,
+                            onChanged: (val) =>
+                                _toggleSong(song, val ?? false),
                             title: Text(
-                              song.title,
+                              _titleOf(song),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: colors.textPrimary),
                             ),
-                            subtitle: Text(song.artist ?? "Desconocido"),
+                            subtitle: Text(
+                              _artistOf(song),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: colors.textSecondary),
+                            ),
                             secondary: CachedArtwork(
                               songId: song.id,
                               width: 50,

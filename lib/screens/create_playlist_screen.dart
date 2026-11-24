@@ -11,12 +11,14 @@ class CreatePlaylistScreen extends StatefulWidget {
   final List<SongModel> availableSongs;
   final PlaylistModelCustom? initialPlaylist;
   final String? defaultName;
+  final Map<int, Map<String, String>> customMetadata;
 
   const CreatePlaylistScreen({
     super.key,
     required this.availableSongs,
     this.initialPlaylist,
     this.defaultName,
+    this.customMetadata = const {},
   });
 
   @override
@@ -25,7 +27,9 @@ class CreatePlaylistScreen extends StatefulWidget {
 
 class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
   final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _searchController = TextEditingController();
   final List<SongModel> _selectedSongs = [];
+  final Set<int> _selectedIds = {};
   String _searchQuery = '';
   String? _selectedCoverPath;
   final ImagePicker _imagePicker = ImagePicker();
@@ -36,9 +40,23 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
     if (widget.initialPlaylist != null) {
       _nameController.text = widget.initialPlaylist!.name;
       _selectedSongs.addAll(widget.initialPlaylist!.songs);
+      _selectedIds.addAll(widget.initialPlaylist!.songs.map((s) => s.id));
       _selectedCoverPath = widget.initialPlaylist!.coverPath;
     }
   }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  String _titleOf(SongModel song) =>
+      widget.customMetadata[song.id]?['title'] ?? song.title;
+
+  String _artistOf(SongModel song) =>
+      widget.customMetadata[song.id]?['artist'] ?? song.artist ?? 'Desconocido';
 
   Future<void> _pickCoverImage() async {
     try {
@@ -124,13 +142,22 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                             ),
                             child: ClipRRect(
                               borderRadius: BorderRadius.circular(15),
-                              child: _selectedCoverPath != null &&
-                                      File(_selectedCoverPath!).existsSync()
+                              child:
+                                  _selectedCoverPath != null &&
+                                      _selectedCoverPath!.isNotEmpty
                                   ? Image.file(
                                       File(_selectedCoverPath!),
                                       fit: BoxFit.cover,
                                       width: 100,
                                       height: 100,
+                                      cacheWidth: 260,
+                                      cacheHeight: 260,
+                                      gaplessPlayback: true,
+                                      errorBuilder: (_, _, _) => const Icon(
+                                        Icons.image_search_rounded,
+                                        size: 40,
+                                        color: Colors.grey,
+                                      ),
                                     )
                                   : _selectedSongs.isEmpty
                                   ? const Icon(
@@ -220,6 +247,7 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                 borderRadius: BorderRadius.circular(20),
               ),
               child: TextField(
+                controller: _searchController,
                 onChanged: (value) => setState(() => _searchQuery = value),
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.onSurface,
@@ -238,6 +266,22 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                       context,
                     ).colorScheme.onSurface.withValues(alpha: 0.5),
                   ),
+                  suffixIcon: _searchQuery.isNotEmpty
+                      ? IconButton(
+                          icon: Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurface.withValues(alpha: 0.6),
+                          ),
+                          tooltip: 'Limpiar búsqueda',
+                          onPressed: () {
+                            _searchController.clear();
+                            setState(() => _searchQuery = '');
+                          },
+                        )
+                      : null,
                 ),
               ),
             ),
@@ -267,12 +311,12 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
           Expanded(
             child: Builder(
               builder: (context) {
-                final filteredSongs = _searchQuery.isEmpty
+                final q = _searchQuery.trim().toLowerCase();
+                final filteredSongs = q.isEmpty
                     ? widget.availableSongs
                     : widget.availableSongs.where((s) {
-                        final q = _searchQuery.toLowerCase();
-                        return s.title.toLowerCase().contains(q) ||
-                            (s.artist ?? "").toLowerCase().contains(q);
+                        return _titleOf(s).toLowerCase().contains(q) ||
+                            _artistOf(s).toLowerCase().contains(q);
                       }).toList();
 
                 if (filteredSongs.isEmpty) {
@@ -286,8 +330,7 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                   itemCount: filteredSongs.length,
                   itemBuilder: (context, index) {
                     final song = filteredSongs[index];
-                    final isSelected =
-                        _selectedSongs.any((s) => s.id == song.id);
+                    final isSelected = _selectedIds.contains(song.id);
                     return CheckboxListTile(
                       value: isSelected,
                       activeColor: const Color(0xFF4CAF50),
@@ -295,13 +338,15 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                         borderRadius: BorderRadius.circular(5),
                       ),
                       title: Text(
-                        song.title,
+                        _titleOf(song),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(color: colorScheme.onSurface),
                       ),
                       subtitle: Text(
-                        song.artist ?? "Desconocido",
+                        _artistOf(song),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           color: colorScheme.onSurface.withValues(alpha: 0.5),
                         ),
@@ -316,8 +361,11 @@ class _CreatePlaylistScreenState extends State<CreatePlaylistScreen> {
                       onChanged: (val) {
                         setState(() {
                           if (val == true) {
-                            _selectedSongs.add(song);
+                            if (_selectedIds.add(song.id)) {
+                              _selectedSongs.add(song);
+                            }
                           } else {
+                            _selectedIds.remove(song.id);
                             _selectedSongs.removeWhere((s) => s.id == song.id);
                           }
                         });
