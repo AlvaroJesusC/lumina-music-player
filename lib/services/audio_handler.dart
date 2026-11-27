@@ -132,14 +132,15 @@ class QueueAwareShuffleOrder extends ShuffleOrder {
 }
 
 /// Manejador principal de audio para Lumina Player.
-/// Extiende [BaseAudioHandler] de audio_service para integrarse
-/// con la notificación persistente y los controles de media del sistema.
+///
+/// Gestiona la cola inteligente (`QueueAwareShuffleOrder`) en memoria sobre un
+/// motor real de doble deck (`CrossfadeEngine` Deck A ↔ Deck B) con ecualizador
+/// sincronizado en ambos decks (`EqualizerEngine`), logrando crossfade estilo
+/// Spotify sin cortes ni pausas en la canción saliente.
 class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   static const String _queueUidExtraKey = 'queueUid';
 
   late final EqualizerEngine _equalizerEngine;
-  late final AudioPlayer _player;
-  late final ConcatenatingAudioSource _playlist;
   late final QueueAwareShuffleOrder _shuffleOrder;
   late final CrossfadeEngine _crossfadeEngine;
 
@@ -147,27 +148,31 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   ValueListenable<List<double>> get equalizerCenterFrequencies =>
       _equalizerEngine.centerFrequenciesHz;
 
+  // Lista maestra en memoria + estado lógico de reproducción y modo aleatorio.
+  final List<MediaItem> _items = [];
+  bool _shuffleEnabled = false;
+  int? _currentActualIndex;
+
   // Identidad única de cada entrada en la cola (incluso si se repite una canción)
   int _nextQueueUid = 1;
   final Set<String> _userQueuedUids = <String>{};
   String? _currentPlayingUid;
   List<String> _currentPlaylistIds = [];
 
-  // Serializa operaciones sobre la cola para evitar carreras con ExoPlayer
+  // Serializa operaciones sobre la cola para evitar carreras de estado.
   Future<void> _opChain = Future<void>.value();
 
   // Notificador reactivo para que QueueBottomSheet se actualice en cada cambio
   final ValueNotifier<int> _queueRevision = ValueNotifier<int>(0);
   ValueListenable<int> get queueRevision => _queueRevision;
 
-  // Suscripciones del reproductor
-  StreamSubscription<int?>? _currentIndexSub;
+  // Suscripción de eventos del deck actualmente activo.
   StreamSubscription<PlaybackEvent>? _playbackEventSub;
-  StreamSubscription<bool>? _shuffleModeSub;
-  StreamSubscription<SequenceState?>? _sequenceStateSub;
 
   // Overrides de metadatos: songId -> {title, artist}
   final Map<String, Map<String, String>> _metadataOverrides = {};
+
+  AudioPlayer get _activePlayer => _crossfadeEngine.activePlayer;
 
   MediaItem _applyOverride(MediaItem item) {
     final ov = _metadataOverrides[item.id];
@@ -191,13 +196,6 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     return item?.extras?[_queueUidExtraKey]?.toString();
   }
 
-  String? _queueUidOfSource(AudioSource source) {
-    if (source is IndexedAudioSource) {
-      return _queueUidOfItem(source.tag as MediaItem?);
-    }
-    return null;
-  }
-
   /// Devuelve una clave estable y única para identificar una fila en
   /// [ReorderableListView], incluso si la misma canción se encoló varias veces.
   String queueEntryKey(MediaItem item, int fallbackIndex) {
@@ -213,27 +211,19 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
 
   MyAudioHandler() {
     _equalizerEngine = EqualizerEngine();
-    _player = AudioPlayer(audioPipeline: _equalizerEngine.pipeline);
     _shuffleOrder = QueueAwareShuffleOrder(
       getPreservedUpcomingIndices: _getContiguousUserQueuedActualIndices,
     );
-    _playlist = ConcatenatingAudioSource(
-      children: [],
-      shuffleOrder: _shuffleOrder,
-    );
     _crossfadeEngine = CrossfadeEngine(
-      primaryPlayer: _player,
-      resolveCurrentTrackUri: _resolveCurrentTrackUri,
+      equalizerEngine: _equalizerEngine,
       resolveCurrentTrackKey: _resolveCurrentTrackKey,
-      canAdvanceToNext: () => _playlist.length > 1,
-      advanceToNext: _advanceTrackForCrossfade,
+      resolveNextTrack: _resolveNextTrackCandidate,
+      onCrossfadeStarted: _handleCrossfadeStarted,
+      onActiveTrackCompleted: _handleActiveTrackCompleted,
+      onActiveDeckChanged: _bindPlaybackStreamToDeck,
       isCrossfadeSuppressed: () => SleepTimerService.instance.isStopAtEndOfSong,
     );
-    unawaited(
-      _initPlayer().catchError((Object e, StackTrace s) {
-        debugPrint('Error inicializando MyAudioHandler: $e\n$s');
-      }),
-    );
+    _bindPlaybackStreamToDeck(_activePlayer);
   }
 
   /// Ejecuta [action] en estricto orden secuencial para evitar carreras entre
@@ -259,45 +249,50 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     _queueRevision.value = _queueRevision.value + 1;
   }
 
-  /// Resuelve de forma segura el índice real de la canción en reproducción
-  /// dentro de `_playlist.children`, incluso si ExoPlayer aún no ha emitido el
-  /// nuevo `currentIndex` tras una eliminación previa.
-  int? _resolveCurrentActualIndex() {
-    final children = _playlist.children;
-    if (children.isEmpty) return null;
+  void _bindPlaybackStreamToDeck(AudioPlayer deck) {
+    unawaited(_playbackEventSub?.cancel());
+    _playbackEventSub = deck.playbackEventStream.listen((_) {
+      if (deck == _activePlayer) {
+        _broadcastState();
+      }
+    });
+    _broadcastState();
+  }
 
-    final playerIdx = _player.currentIndex;
-    if (playerIdx != null && playerIdx >= 0 && playerIdx < children.length) {
+  /// Resuelve de forma segura el índice real de la canción en reproducción
+  /// dentro de [_items].
+  int? _resolveCurrentActualIndex() {
+    if (_items.isEmpty) return null;
+
+    final idx = _currentActualIndex;
+    if (idx != null && idx >= 0 && idx < _items.length) {
       if (_currentPlayingUid == null ||
-          _queueUidOfSource(children[playerIdx]) == _currentPlayingUid) {
-        return playerIdx;
+          _queueUidOfItem(_items[idx]) == _currentPlayingUid) {
+        return idx;
       }
     }
 
     if (_currentPlayingUid != null) {
-      for (var i = 0; i < children.length; i++) {
-        if (_queueUidOfSource(children[i]) == _currentPlayingUid) {
+      for (var i = 0; i < _items.length; i++) {
+        if (_queueUidOfItem(_items[i]) == _currentPlayingUid) {
+          _currentActualIndex = i;
           return i;
         }
       }
     }
 
-    if (playerIdx != null && playerIdx >= 0 && playerIdx < children.length) {
-      return playerIdx;
+    if (idx != null && idx >= 0 && idx < _items.length) {
+      return idx;
     }
     return null;
   }
 
   List<int> _currentEffectiveOrder() {
-    final length = _playlist.length;
+    final length = _items.length;
     if (length == 0) return const [];
-    if (_player.shuffleModeEnabled) {
+    if (_shuffleEnabled) {
       if (_shuffleOrder.indices.length == length) {
         return _shuffleOrder.indices;
-      }
-      final fallback = _player.effectiveIndices;
-      if (fallback != null && fallback.length == length) {
-        return fallback;
       }
     }
     return List<int>.generate(length, (i) => i);
@@ -307,12 +302,11 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     required List<int> order,
     required int currentPos,
   }) {
-    final children = _playlist.children;
     var count = 0;
     for (var pos = currentPos + 1; pos < order.length; pos++) {
       final actualIdx = order[pos];
-      if (actualIdx < 0 || actualIdx >= children.length) break;
-      final uid = _queueUidOfSource(children[actualIdx]);
+      if (actualIdx < 0 || actualIdx >= _items.length) break;
+      final uid = _queueUidOfItem(_items[actualIdx]);
       if (uid != null && _userQueuedUids.contains(uid)) {
         count++;
       } else {
@@ -339,49 +333,13 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     return order.sublist(currentPos + 1, currentPos + 1 + count);
   }
 
-  Future<void> _initPlayer() async {
-    try {
-      await _player.setAudioSource(_playlist);
-      _equalizerEngine.attachToActivePlayer();
-      await _player.setLoopMode(LoopMode.all);
-      _notifyAudioHandlerAboutPlaybackEvents();
-      _listenForSequenceStateChanges();
-
-      // Seguimiento de la canción en reproducción para consumir canciones de la
-      // cola manual cuando efectivamente comienzan a reproducirse.
-      _currentIndexSub = _player.currentIndexStream.listen((index) {
-        if (index != null && index >= 0 && index < _playlist.length) {
-          final uid = _queueUidOfSource(_playlist.children[index]);
-          if (uid != null) {
-            _currentPlayingUid = uid;
-            if (_userQueuedUids.remove(uid)) {
-              _bumpQueueRevision();
-            }
-          }
-        }
-      });
-    } catch (e) {
-      debugPrint('Error inicializando player: $e');
-    }
-  }
-
-  void _notifyAudioHandlerAboutPlaybackEvents() {
-    _playbackEventSub = _player.playbackEventStream.listen((_) {
-      _broadcastState();
-    });
-    _shuffleModeSub = _player.shuffleModeEnabledStream.listen((_) {
-      _broadcastState();
-      _bumpQueueRevision();
-    });
-  }
-
   void _broadcastState() {
-    final playing = _player.playing;
-    final queueIndex = _resolveCurrentActualIndex() ?? _player.currentIndex;
+    final player = _activePlayer;
+    final playing = player.playing;
+    final queueIndex = _resolveCurrentActualIndex();
 
     final processingState =
-        (_player.processingState == ProcessingState.ready &&
-            _playlist.length == 0)
+        (player.processingState == ProcessingState.ready && _items.isEmpty)
         ? AudioProcessingState.idle
         : const {
             ProcessingState.idle: AudioProcessingState.idle,
@@ -389,7 +347,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
             ProcessingState.buffering: AudioProcessingState.buffering,
             ProcessingState.ready: AudioProcessingState.ready,
             ProcessingState.completed: AudioProcessingState.completed,
-          }[_player.processingState]!;
+          }[player.processingState]!;
 
     playbackState.add(
       playbackState.value.copyWith(
@@ -407,51 +365,40 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         androidCompactActionIndices: const [0, 1, 2],
         processingState: processingState,
         playing: playing,
-        updatePosition: _player.position,
-        bufferedPosition: _player.bufferedPosition,
-        speed: _player.speed,
+        updatePosition: player.position,
+        bufferedPosition: player.bufferedPosition,
+        speed: player.speed,
         queueIndex: queueIndex,
-        shuffleMode: (_player.shuffleModeEnabled)
+        shuffleMode: _shuffleEnabled
             ? AudioServiceShuffleMode.all
             : AudioServiceShuffleMode.none,
       ),
     );
   }
 
-  void _listenForSequenceStateChanges() {
-    _sequenceStateSub = _player.sequenceStateStream.listen((
-      SequenceState? sequenceState,
-    ) {
-      final sequence = sequenceState?.sequence;
-      if (sequence == null || sequence.isEmpty) {
-        _bumpQueueRevision();
-        return;
-      }
-
-      // Actualizar mediaItem actual aplicando override si existe
-      final currentItem = sequenceState?.currentSource?.tag as MediaItem?;
-      if (currentItem != null) {
-        final uid = _queueUidOfItem(currentItem);
-        if (uid != null) {
-          _currentPlayingUid = uid;
-          _userQueuedUids.remove(uid);
-        }
-        mediaItem.add(_applyOverride(currentItem));
-      }
-
-      // Optimización Binder IPC: Para evitar sobrecargar el canal del sistema
-      // (límite de 1MB en Android Binder), enviamos una ventana segura a queue
-      final currentIdx = sequenceState?.currentIndex ?? 0;
-      final start = (currentIdx - 5).clamp(0, sequence.length);
-      final end = (currentIdx + 45).clamp(0, sequence.length);
-
-      final windowSources = sequence.sublist(start, end);
-      final items = windowSources
-          .map((source) => _applyOverride(source.tag as MediaItem))
-          .toList();
-      queue.add(items);
+  /// Publica el elemento actual y una ventana acotada de la cola hacia Android
+  /// MediaSession (evitando el límite de 1 MB de Binder IPC).
+  void _publishCurrentAndQueueWindow() {
+    if (_items.isEmpty) {
+      queue.add(const []);
       _bumpQueueRevision();
-    });
+      return;
+    }
+
+    final currentIdx = _resolveCurrentActualIndex() ?? 0;
+    final currentItem = _items[currentIdx];
+    final uid = _queueUidOfItem(currentItem);
+    if (uid != null) {
+      _currentPlayingUid = uid;
+      _userQueuedUids.remove(uid);
+    }
+    mediaItem.add(_applyOverride(currentItem));
+
+    final start = (currentIdx - 5).clamp(0, _items.length);
+    final end = (currentIdx + 45).clamp(0, _items.length);
+    final windowItems = _items.sublist(start, end).map(_applyOverride).toList();
+    queue.add(windowItems);
+    _bumpQueueRevision();
   }
 
   /// Resuelve rutas de audio locales y URLs de forma segura para evitar
@@ -466,6 +413,9 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     return Uri.file(urlString);
   }
 
+  Uri _uriOfItem(MediaItem item) =>
+      _resolveUri(item.extras?['url']?.toString() ?? '');
+
   bool _listEquals(List<String> a, List<String> b) {
     if (identical(a, b)) return true;
     if (a.length != b.length) return false;
@@ -473,6 +423,118 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       if (a[i] != b[i]) return false;
     }
     return true;
+  }
+
+  String? _resolveCurrentTrackKey() {
+    if (_currentPlayingUid != null) return _currentPlayingUid;
+    final idx = _resolveCurrentActualIndex();
+    if (idx == null || idx < 0 || idx >= _items.length) return null;
+    return _queueUidOfItem(_items[idx]) ?? _items[idx].id;
+  }
+
+  /// Devuelve el siguiente candidato en orden efectivo (respetando aleatorio,
+  /// cola manual FIFO y repetición circular de la lista).
+  NextTrackCandidate? _resolveNextTrackCandidate() {
+    if (_items.length <= 1) return null;
+    final currentActual = _resolveCurrentActualIndex();
+    if (currentActual == null) return null;
+
+    final order = _currentEffectiveOrder();
+    if (order.length <= 1) return null;
+
+    final currentPos = order.indexOf(currentActual);
+    final nextPos = currentPos == -1 ? 0 : (currentPos + 1) % order.length;
+    final nextActual = order[nextPos];
+    if (nextActual < 0 || nextActual >= _items.length) return null;
+
+    final nextItem = _items[nextActual];
+    final uri = _uriOfItem(nextItem);
+    if (uri.toString().isEmpty) return null;
+
+    return NextTrackCandidate(
+      actualIndex: nextActual,
+      trackKey: _queueUidOfItem(nextItem) ?? '${nextItem.id}_$nextActual',
+      uri: uri,
+      mediaItem: _applyOverride(nextItem),
+    );
+  }
+
+  /// Invocado por [CrossfadeEngine] justo al iniciar la mezcla en el segundo
+  /// deck: actualiza el índice actual, consume la entrada de cola manual y
+  /// refresca UI + notificación inmediatamente (estilo Spotify).
+  void _handleCrossfadeStarted(
+    NextTrackCandidate next,
+    AudioPlayer newActiveDeck,
+  ) {
+    if (next.actualIndex < 0 || next.actualIndex >= _items.length) return;
+    _currentActualIndex = next.actualIndex;
+    _currentPlayingUid = _queueUidOfItem(_items[next.actualIndex]);
+    if (_currentPlayingUid != null) {
+      _userQueuedUids.remove(_currentPlayingUid);
+    }
+    _publishCurrentAndQueueWindow();
+    _broadcastState();
+  }
+
+  /// Invocado cuando el deck activo llega al final natural de una pista
+  /// (cuando crossfade está en `0 s`, la pista era muy corta o está activo
+  /// el temporizador "Al final de esta canción").
+  Future<void> _handleActiveTrackCompleted() {
+    return _enqueueOp(() async {
+      if (_items.isEmpty) return;
+
+      final stopAtEndOfSong = SleepTimerService.instance.isStopAtEndOfSong;
+
+      if (_items.length == 1) {
+        final onlyItem = _items.first;
+        if (stopAtEndOfSong) {
+          await _crossfadeEngine.loadAndPlayOnActiveDeck(
+            _uriOfItem(onlyItem),
+            autoPlay: false,
+          );
+          SleepTimerService.instance.cancelTimer();
+        } else {
+          await _crossfadeEngine.loadAndPlayOnActiveDeck(
+            _uriOfItem(onlyItem),
+            autoPlay: true,
+          );
+        }
+        _broadcastState();
+        return;
+      }
+
+      final next = _resolveNextTrackCandidate();
+      if (next == null) return;
+
+      _currentActualIndex = next.actualIndex;
+      _currentPlayingUid = _queueUidOfItem(_items[next.actualIndex]);
+      if (_currentPlayingUid != null) {
+        _userQueuedUids.remove(_currentPlayingUid);
+      }
+
+      if (stopAtEndOfSong) {
+        await _crossfadeEngine.loadAndPlayOnActiveDeck(
+          next.uri,
+          autoPlay: false,
+        );
+        _publishCurrentAndQueueWindow();
+        _broadcastState();
+        return;
+      }
+
+      final switched = await _crossfadeEngine.switchToPreloadedStandby(
+        expected: next,
+        autoPlay: true,
+      );
+      if (!switched) {
+        await _crossfadeEngine.loadAndPlayOnActiveDeck(
+          next.uri,
+          autoPlay: true,
+        );
+      }
+      _publishCurrentAndQueueWindow();
+      _broadcastState();
+    });
   }
 
   /// Guarda un override de título/artista y re-emite los streams
@@ -489,53 +551,45 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }
 
   void _reEmitWithOverrides(String songId) {
-    final sequence = _player.sequence;
-    if (sequence != null) {
-      final currentIdx = _resolveCurrentActualIndex() ?? 0;
-      final start = (currentIdx - 5).clamp(0, sequence.length);
-      final end = (currentIdx + 45).clamp(0, sequence.length);
-      final updatedItems = sequence
-          .sublist(start, end)
-          .map((source) => _applyOverride(source.tag as MediaItem))
-          .toList();
-      queue.add(updatedItems);
-    }
-    final currentTag =
-        _player.sequenceState?.currentSource?.tag as MediaItem?;
-    if (currentTag != null && currentTag.id == songId) {
+    if (_items.isEmpty) return;
+    final currentIdx = _resolveCurrentActualIndex() ?? 0;
+    final start = (currentIdx - 5).clamp(0, _items.length);
+    final end = (currentIdx + 45).clamp(0, _items.length);
+    queue.add(_items.sublist(start, end).map(_applyOverride).toList());
+
+    final currentTag = _items[currentIdx];
+    if (currentTag.id == songId) {
       mediaItem.add(_applyOverride(currentTag));
     }
     _bumpQueueRevision();
   }
 
-  Future<void> _loadQueueItemsInternal(List<MediaItem> mediaItems) async {
+  void _loadQueueItemsInternal(List<MediaItem> mediaItems) {
     final newIds = mediaItems.map((e) => e.id).toList();
 
     // Optimización: si ya es la misma lista cargada y sin canciones manuales
-    // pendientes, no recreamos las fuentes desde cero.
+    // pendientes, conservamos las entradas actuales.
     if (_listEquals(_currentPlaylistIds, newIds) &&
-        _playlist.length == mediaItems.length &&
+        _items.length == mediaItems.length &&
         _userQueuedUids.isEmpty) {
       return;
     }
 
     _userQueuedUids.clear();
     _currentPlayingUid = null;
+    _currentActualIndex = null;
     _currentPlaylistIds = newIds;
 
-    final audioSources = mediaItems.map((item) {
-      final tagged = _tagWithQueueUid(item);
-      return AudioSource.uri(
-        _resolveUri(tagged.extras?['url']?.toString() ?? ''),
-        tag: tagged,
-      );
-    }).toList();
+    _items
+      ..clear()
+      ..addAll(mediaItems.map(_tagWithQueueUid));
 
     _shuffleOrder.pendingInsertShufflePos = null;
-    await _playlist.clear();
-    if (audioSources.isNotEmpty) {
-      await _playlist.addAll(audioSources);
+    _shuffleOrder.clear();
+    if (_items.isNotEmpty) {
+      _shuffleOrder.insert(0, _items.length);
     }
+    _crossfadeEngine.invalidatePreload();
   }
 
   /// Carga una lista y reproduce desde [initialIndex]. Si el modo aleatorio
@@ -549,51 +603,44 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   }) {
     return _enqueueOp(() async {
       if (mediaItems.isEmpty) return;
-      await _crossfadeEngine.cancelActiveTransition();
 
       final safeIndex = initialIndex.clamp(0, mediaItems.length - 1);
-      await _loadQueueItemsInternal(mediaItems);
+      _loadQueueItemsInternal(mediaItems);
 
-      if (shuffleEnabled != null &&
-          _player.shuffleModeEnabled != shuffleEnabled) {
-        await _player.setShuffleModeEnabled(shuffleEnabled);
+      if (shuffleEnabled != null) {
+        _shuffleEnabled = shuffleEnabled;
       }
 
-      if (safeIndex < _playlist.length) {
-        _currentPlayingUid = _queueUidOfSource(_playlist.children[safeIndex]);
-      }
+      _currentActualIndex = safeIndex;
+      final selectedItem = _items[safeIndex];
+      _currentPlayingUid = _queueUidOfItem(selectedItem);
 
-      await _player.seek(Duration.zero, index: safeIndex);
-
-      if (_player.shuffleModeEnabled && _playlist.length > 1) {
+      if (_shuffleEnabled && _items.length > 1) {
         _shuffleOrder.forcedInitialIndex = safeIndex;
         try {
-          await _player.shuffle();
+          _shuffleOrder.shuffle(initialIndex: safeIndex);
         } finally {
           _shuffleOrder.forcedInitialIndex = null;
         }
       }
 
-      _bumpQueueRevision();
-      // IMPORTANTE: en just_audio, `_player.play()` solo completa al pausar o
-      // terminar la reproducción. No hacer `await` dentro de `_enqueueOp` para
-      // no bloquear operaciones posteriores de cola, shuffle o cambio de pista.
-      unawaited(
-        _player.play().catchError((Object e, StackTrace s) {
-          debugPrint('Error iniciando reproducción en playFromList: $e\n$s');
-        }),
+      _publishCurrentAndQueueWindow();
+      await _crossfadeEngine.loadAndPlayOnActiveDeck(
+        _uriOfItem(selectedItem),
+        autoPlay: true,
       );
+      _broadcastState();
     });
   }
 
   @override
   Future<void> addQueueItems(List<MediaItem> mediaItems) {
     return _enqueueOp(() async {
-      await _loadQueueItemsInternal(mediaItems);
-      if (_player.shuffleModeEnabled && _playlist.length > 1) {
-        await _player.shuffle();
+      _loadQueueItemsInternal(mediaItems);
+      if (_shuffleEnabled && _items.length > 1) {
+        _shuffleOrder.shuffle(initialIndex: _currentActualIndex);
       }
-      _bumpQueueRevision();
+      _publishCurrentAndQueueWindow();
     });
   }
 
@@ -603,46 +650,42 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       try {
         final taggedItem = _tagWithQueueUid(mediaItem);
         final queueUid = _queueUidOfItem(taggedItem)!;
-        final url = taggedItem.extras?['url']?.toString() ?? '';
-        final audioSource = AudioSource.uri(_resolveUri(url), tag: taggedItem);
-
         final currentActual = _resolveCurrentActualIndex();
 
         // Si el reproductor está vacío o no se ha iniciado:
-        if (_playlist.length == 0 || currentActual == null) {
-          await _crossfadeEngine.cancelActiveTransition();
+        if (_items.isEmpty || currentActual == null) {
           _shuffleOrder.pendingInsertShufflePos = null;
           _userQueuedUids.clear();
           _currentPlaylistIds = [taggedItem.id];
+          _items
+            ..clear()
+            ..add(taggedItem);
+          _shuffleOrder.clear();
+          _shuffleOrder.insert(0, 1);
+          _currentActualIndex = 0;
           _currentPlayingUid = queueUid;
-          await _playlist.add(audioSource);
-          await _player.seek(Duration.zero, index: 0);
-          super.mediaItem.add(_applyOverride(taggedItem));
-          _bumpQueueRevision();
-          unawaited(
-            _player.play().catchError((Object e, StackTrace s) {
-              debugPrint(
-                'Error iniciando reproducción desde addQueueItem: $e\n$s',
-              );
-            }),
+          _publishCurrentAndQueueWindow();
+          await _crossfadeEngine.loadAndPlayOnActiveDeck(
+            _uriOfItem(taggedItem),
+            autoPlay: true,
           );
+          _broadcastState();
           return;
         }
 
-        // 1. Calcular inserción en orden lineal (siempre estrictamente después
-        // de currentActual para nunca desplazar la pista en reproducción).
-        final rawOrder = List<int>.generate(_playlist.length, (i) => i);
+        // 1. Inserción en orden lineal (siempre estrictamente después de
+        //    currentActual y de las canciones encoladas manualmente antes).
+        final rawOrder = List<int>.generate(_items.length, (i) => i);
         final rawUserQueueCount = _contiguousUserQueueCountInOrder(
           order: rawOrder,
           currentPos: currentActual,
         );
         final insertIndex = (currentActual + 1 + rawUserQueueCount).clamp(
           currentActual + 1,
-          _playlist.length,
+          _items.length,
         );
 
-        // 2. Calcular inserción exacta en el orden aleatorio (FIFO después de
-        // la canción actual y cualquier canción encolada manualmente antes).
+        // 2. Inserción exacta en orden aleatorio (FIFO después de actual + cola).
         final currentPosInShuffle = _shuffleOrder.indices.indexOf(
           currentActual,
         );
@@ -660,38 +703,25 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         }
 
         _userQueuedUids.add(queueUid);
-        _shuffleOrder.pendingInsertShufflePos = targetShufflePos;
-        try {
-          await _playlist.insert(insertIndex, audioSource);
-        } finally {
-          _shuffleOrder.pendingInsertShufflePos = null;
-        }
-
+        _items.insert(insertIndex, taggedItem);
         if (insertIndex <= _currentPlaylistIds.length) {
           _currentPlaylistIds.insert(insertIndex, taggedItem.id);
         }
 
-        // Re-sincronizar explícitamente el orden aleatorio en ExoPlayer si el
-        // modo aleatorio está activo, evitando desfaces temporales tras insert.
-        if (_player.shuffleModeEnabled) {
-          await _syncShuffleOrderWithoutReshuffling();
+        _shuffleOrder.pendingInsertShufflePos = targetShufflePos;
+        try {
+          _shuffleOrder.insert(insertIndex, 1);
+        } finally {
+          _shuffleOrder.pendingInsertShufflePos = null;
         }
 
-        _bumpQueueRevision();
+        _crossfadeEngine.invalidatePreload();
+        _publishCurrentAndQueueWindow();
       } catch (e, s) {
         debugPrint('Error al añadir a la cola: $e\n$s');
         rethrow;
       }
     });
-  }
-
-  Future<void> _syncShuffleOrderWithoutReshuffling() async {
-    _shuffleOrder.suppressNextShuffle = true;
-    try {
-      await _player.shuffle();
-    } finally {
-      _shuffleOrder.suppressNextShuffle = false;
-    }
   }
 
   /// Remueve una canción de la cola usando su índice efectivo (visual).
@@ -700,39 +730,47 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       final order = _currentEffectiveOrder();
       if (effectiveIndex < 0 || effectiveIndex >= order.length) return;
       final actualIdx = order[effectiveIndex];
-      await _removeActualIndexInternal(actualIdx);
+      _removeActualIndexInternal(actualIdx);
     });
   }
 
   /// Remueve una canción de la cola en el índice real especificado.
   @override
   Future<void> removeQueueItemAt(int index) {
-    return _enqueueOp(() => _removeActualIndexInternal(index));
+    return _enqueueOp(() async => _removeActualIndexInternal(index));
   }
 
-  Future<void> _removeActualIndexInternal(int index) async {
-    if (index < 0 || index >= _playlist.length) return;
+  void _removeActualIndexInternal(int index) {
+    if (index < 0 || index >= _items.length) return;
 
-    final removedUid = _queueUidOfSource(_playlist.children[index]);
+    final removedUid = _queueUidOfItem(_items[index]);
     if (removedUid != null) {
       _userQueuedUids.remove(removedUid);
     }
 
+    _items.removeAt(index);
     if (index < _currentPlaylistIds.length) {
       _currentPlaylistIds.removeAt(index);
     }
+    _shuffleOrder.removeRange(index, index + 1);
 
-    await _playlist.removeAt(index);
-    _bumpQueueRevision();
+    if (_currentActualIndex != null) {
+      if (_items.isEmpty) {
+        _currentActualIndex = null;
+        _currentPlayingUid = null;
+      } else if (index < _currentActualIndex!) {
+        _currentActualIndex = _currentActualIndex! - 1;
+      } else if (index == _currentActualIndex!) {
+        _currentActualIndex = _currentActualIndex!.clamp(0, _items.length - 1);
+      }
+    }
+
+    _crossfadeEngine.invalidatePreload();
+    _publishCurrentAndQueueWindow();
   }
 
   /// Reordena una canción en la fila visual (índice efectivo [fromEffectiveIndex]
   /// hacia [toEffectiveIndex]).
-  ///
-  /// - En modo aleatorio: reordena únicamente [_shuffleOrder.indices] y lo
-  ///   sincroniza con `just_audio`/ExoPlayer sin tocar `_playlist.children`,
-  ///   evitando que la canción desaparezca o desplace la pista actual.
-  /// - En modo normal: mueve la pista en `_playlist` de forma segura.
   Future<void> reorderEffectiveQueueItem(
     int fromEffectiveIndex,
     int toEffectiveIndex,
@@ -755,9 +793,9 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         currentPos: currentEffective,
       );
       final movedActualIdx = order[fromEffectiveIndex];
-      final movedUid = _queueUidOfSource(_playlist.children[movedActualIdx]);
+      final movedUid = _queueUidOfItem(_items[movedActualIdx]);
 
-      if (_player.shuffleModeEnabled) {
+      if (_shuffleEnabled) {
         final didMove = _shuffleOrder.moveEffectiveIndex(
           fromEffectiveIndex,
           toEffectiveIndex,
@@ -771,15 +809,19 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           currentEffectiveIndex: currentEffective,
           userQueueCountBefore: userQueueCountBefore,
         );
-
-        _bumpQueueRevision();
-        await _syncShuffleOrderWithoutReshuffling();
       } else {
+        final movedItem = _items.removeAt(fromEffectiveIndex);
+        _items.insert(toEffectiveIndex, movedItem);
+
         if (fromEffectiveIndex < _currentPlaylistIds.length &&
             toEffectiveIndex < _currentPlaylistIds.length) {
           final id = _currentPlaylistIds.removeAt(fromEffectiveIndex);
           _currentPlaylistIds.insert(toEffectiveIndex, id);
         }
+
+        // Mantener _shuffleOrder alineado con el nuevo tamaño/índices.
+        _shuffleOrder.clear();
+        _shuffleOrder.insert(0, _items.length);
 
         _updateUserQueueMembershipAfterReorder(
           movedUid: movedUid,
@@ -788,11 +830,10 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           currentEffectiveIndex: currentEffective,
           userQueueCountBefore: userQueueCountBefore,
         );
-
-        await _playlist.move(fromEffectiveIndex, toEffectiveIndex);
       }
 
-      _bumpQueueRevision();
+      _crossfadeEngine.invalidatePreload();
+      _publishCurrentAndQueueWindow();
     });
   }
 
@@ -811,10 +852,8 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     final wasInUserQueue = fromEffectiveIndex <= userQueueEndBefore;
 
     if (!wasInUserQueue && toEffectiveIndex <= userQueueEndBefore) {
-      // El usuario promovió una pista dentro de la sección de cola manual.
       _userQueuedUids.add(movedUid);
     } else if (wasInUserQueue && toEffectiveIndex > userQueueEndBefore) {
-      // El usuario movió una pista de la cola manual después de pistas normales.
       _userQueuedUids.remove(movedUid);
     }
   }
@@ -822,45 +861,44 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   /// Mueve una canción por índice real (compatibilidad para modo lineal).
   Future<void> moveQueueItem(int fromIndex, int toIndex) {
     return _enqueueOp(() async {
-      if (fromIndex < 0 || fromIndex >= _playlist.length) return;
-      if (toIndex < 0 || toIndex >= _playlist.length) return;
+      if (fromIndex < 0 || fromIndex >= _items.length) return;
+      if (toIndex < 0 || toIndex >= _items.length) return;
       if (fromIndex == toIndex) return;
 
-      if (_player.shuffleModeEnabled) {
+      if (_shuffleEnabled) {
         final fromEff = _shuffleOrder.indices.indexOf(fromIndex);
         final toEff = _shuffleOrder.indices.indexOf(toIndex);
         if (fromEff != -1 && toEff != -1) {
           _shuffleOrder.moveEffectiveIndex(fromEff, toEff);
-          await _syncShuffleOrderWithoutReshuffling();
+          _crossfadeEngine.invalidatePreload();
           _bumpQueueRevision();
         }
         return;
       }
 
+      final moved = _items.removeAt(fromIndex);
+      _items.insert(toIndex, moved);
       if (fromIndex < _currentPlaylistIds.length &&
           toIndex < _currentPlaylistIds.length) {
         final id = _currentPlaylistIds.removeAt(fromIndex);
         _currentPlaylistIds.insert(toIndex, id);
       }
-      await _playlist.move(fromIndex, toIndex);
-      _bumpQueueRevision();
+      _currentActualIndex = _resolveCurrentActualIndex();
+      _crossfadeEngine.invalidatePreload();
+      _publishCurrentAndQueueWindow();
     });
   }
 
   /// Devuelve los elementos en el orden efectivo de reproducción (respetando
   /// el modo aleatorio si está activo).
   List<MediaItem> get effectiveQueueItems {
-    final children = _playlist.children;
-    if (children.isEmpty) return [];
+    if (_items.isEmpty) return [];
 
     final indices = _currentEffectiveOrder();
     final items = <MediaItem>[];
     for (final idx in indices) {
-      if (idx >= 0 && idx < children.length) {
-        final source = children[idx];
-        if (source is IndexedAudioSource && source.tag is MediaItem) {
-          items.add(_applyOverride(source.tag as MediaItem));
-        }
+      if (idx >= 0 && idx < _items.length) {
+        items.add(_applyOverride(_items[idx]));
       }
     }
     return items;
@@ -883,43 +921,6 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     return indices.indexOf(currentIdx);
   }
 
-  Uri? _resolveCurrentTrackUri() {
-    final idx = _resolveCurrentActualIndex();
-    if (idx == null || idx < 0 || idx >= _playlist.children.length) return null;
-    final source = _playlist.children[idx];
-    if (source is IndexedAudioSource && source.tag is MediaItem) {
-      final item = source.tag as MediaItem;
-      final url = item.extras?['url']?.toString() ?? '';
-      if (url.isEmpty) return null;
-      return _resolveUri(url);
-    }
-    return null;
-  }
-
-  String? _resolveCurrentTrackKey() {
-    if (_currentPlayingUid != null) return _currentPlayingUid;
-    final idx = _resolveCurrentActualIndex();
-    if (idx == null || idx < 0 || idx >= _playlist.children.length) return null;
-    final source = _playlist.children[idx];
-    if (source is IndexedAudioSource && source.tag is MediaItem) {
-      return (source.tag as MediaItem).id;
-    }
-    return null;
-  }
-
-  Future<void> _advanceTrackForCrossfade() async {
-    if (_playlist.length == 0) return;
-    if (_player.hasNext) {
-      await _player.seekToNext();
-    } else {
-      if (_player.shuffleModeEnabled) {
-        await _player.shuffle();
-      }
-      final nextIndex = _player.effectiveIndices?.first ?? 0;
-      await _player.seek(Duration.zero, index: nextIndex);
-    }
-  }
-
   /// Aplica el factor de atenuación `[0.0, 1.0]` del temporizador de apagado.
   Future<void> setSleepTimerVolumeFactor(double factor) =>
       _crossfadeEngine.setSleepTimerVolumeFactor(factor);
@@ -940,42 +941,94 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> seek(Duration position) async {
     await _crossfadeEngine.cancelActiveTransition();
-    await _player.seek(position);
+    await _activePlayer.seek(position);
+    _broadcastState();
   }
 
   @override
-  Future<void> skipToNext() async {
-    if (_playlist.length == 0) return;
-    await _crossfadeEngine.cancelActiveTransition();
-    await _advanceTrackForCrossfade();
+  Future<void> skipToNext() {
+    return _enqueueOp(() async {
+      if (_items.isEmpty) return;
+
+      final order = _currentEffectiveOrder();
+      final currentActual = _resolveCurrentActualIndex();
+      final currentPos = currentActual == null
+          ? -1
+          : order.indexOf(currentActual);
+
+      int nextActual;
+      if (order.length <= 1) {
+        nextActual = 0;
+      } else if (currentPos >= 0 && currentPos + 1 < order.length) {
+        nextActual = order[currentPos + 1];
+      } else {
+        if (_shuffleEnabled) {
+          _shuffleOrder.shuffle();
+        }
+        nextActual = _currentEffectiveOrder().first;
+      }
+
+      await _playActualIndex(nextActual);
+    });
   }
 
   @override
-  Future<void> skipToPrevious() async {
-    if (_playlist.length == 0) return;
-    await _crossfadeEngine.cancelActiveTransition();
-    if (_player.hasPrevious) {
-      await _player.seekToPrevious();
-    } else {
-      final lastIndex = _player.effectiveIndices?.last ?? (_playlist.length - 1);
-      await _player.seek(Duration.zero, index: lastIndex);
+  Future<void> skipToPrevious() {
+    return _enqueueOp(() async {
+      if (_items.isEmpty) return;
+
+      final order = _currentEffectiveOrder();
+      final currentActual = _resolveCurrentActualIndex();
+      final currentPos = currentActual == null
+          ? -1
+          : order.indexOf(currentActual);
+
+      int prevActual;
+      if (order.length <= 1) {
+        prevActual = 0;
+      } else if (currentPos > 0) {
+        prevActual = order[currentPos - 1];
+      } else {
+        prevActual = order.last;
+      }
+
+      await _playActualIndex(prevActual);
+    });
+  }
+
+  Future<void> _playActualIndex(int actualIndex) async {
+    if (actualIndex < 0 || actualIndex >= _items.length) return;
+    final targetItem = _items[actualIndex];
+    _currentActualIndex = actualIndex;
+    _currentPlayingUid = _queueUidOfItem(targetItem);
+    if (_currentPlayingUid != null) {
+      _userQueuedUids.remove(_currentPlayingUid);
     }
+
+    _publishCurrentAndQueueWindow();
+    await _crossfadeEngine.loadAndPlayOnActiveDeck(
+      _uriOfItem(targetItem),
+      autoPlay: true,
+    );
+    _broadcastState();
   }
 
   @override
   Future<void> setShuffleMode(AudioServiceShuffleMode shuffleMode) {
     return _enqueueOp(() async {
       final enabled = shuffleMode != AudioServiceShuffleMode.none;
-      if (enabled && _playlist.length > 1) {
+      _shuffleEnabled = enabled;
+      if (enabled && _items.length > 1) {
         final currentActual = _resolveCurrentActualIndex();
         _shuffleOrder.forcedInitialIndex = currentActual;
         try {
-          await _player.shuffle();
+          _shuffleOrder.shuffle(initialIndex: currentActual);
         } finally {
           _shuffleOrder.forcedInitialIndex = null;
         }
       }
-      await _player.setShuffleModeEnabled(enabled);
+      _crossfadeEngine.invalidatePreload();
+      _broadcastState();
       _bumpQueueRevision();
     });
   }
@@ -983,40 +1036,30 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   @override
   Future<void> skipToQueueItem(int index) {
     return _enqueueOp(() async {
-      if (index < 0 || index >= _playlist.length) return;
-      await _crossfadeEngine.cancelActiveTransition();
-      final targetUid = _queueUidOfSource(_playlist.children[index]);
-      if (targetUid != null) {
-        _currentPlayingUid = targetUid;
-        _userQueuedUids.remove(targetUid);
-      }
-      await _player.seek(Duration.zero, index: index);
-      _bumpQueueRevision();
+      if (index < 0 || index >= _items.length) return;
+      await _playActualIndex(index);
     });
   }
 
   @override
   Future<void> stop() async {
-    await _crossfadeEngine.cancelActiveTransition();
-    await _player.stop();
+    await _crossfadeEngine.stopBothDecks();
+    _broadcastState();
     return super.stop();
   }
 
   @override
   Future<void> onTaskRemoved() async {
-    if (!_player.playing) {
+    if (!_activePlayer.playing) {
       await stop();
     }
   }
 
   Future<void> dispose() async {
+    await _playbackEventSub?.cancel();
+    _playbackEventSub = null;
     await _crossfadeEngine.dispose();
     _equalizerEngine.dispose();
-    await _currentIndexSub?.cancel();
-    await _playbackEventSub?.cancel();
-    await _shuffleModeSub?.cancel();
-    await _sequenceStateSub?.cancel();
     _queueRevision.dispose();
-    await _player.dispose();
   }
 }

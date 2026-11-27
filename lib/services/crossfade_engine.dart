@@ -1,85 +1,265 @@
 import 'dart:async';
 
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 
+import 'equalizer_engine.dart';
 import 'playback_transition_settings.dart';
 
-/// Motor desacoplado de transiciones suaves de audio para Lumina Player.
+/// Descriptor inmutable de la siguiente pista que debe precargarse o iniciarse
+/// en el deck secundario durante un crossfade real sin cortes.
+@immutable
+final class NextTrackCandidate {
+  const NextTrackCandidate({
+    required this.actualIndex,
+    required this.trackKey,
+    required this.uri,
+    required this.mediaItem,
+  });
+
+  /// Índice real en la lista interna del handler.
+  final int actualIndex;
+
+  /// Clave única de la entrada en cola (evita duplicados cuando se repite tema).
+  final String trackKey;
+
+  /// URI local o remota resuelta del archivo de audio.
+  final Uri uri;
+
+  /// Metadatos de la siguiente pista para publicar al iniciar el cruce.
+  final MediaItem mediaItem;
+}
+
+/// Motor real de doble deck (ping-pong Deck A ↔ Deck B) para transiciones
+/// estilo Spotify **sin ningún corte ni pausa en la canción saliente**.
 ///
-/// Gestiona tres comportamientos sin ensuciar `MyAudioHandler`:
-/// 1. **Crossfade real estilo Spotify:** Solapa los últimos `N` segundos de la
-///    canción saliente con el inicio de la siguiente usando un reproductor
-///    auxiliar silencioso respecto al foco de audio del sistema
-///    (`handleAudioSessionActivation: false`, `handleInterruptions: false`) y
-///    una curva equal-power (coseno/seno).
-/// 2. **Fundido suave en Play/Pausa:** Atenúa el volumen antes de pausar y lo
-///    eleva gradualmente al reanudar, cancelándose limpiamente si el usuario
-///    pulsa rápido varias veces.
-/// 3. **Atenuación progresiva del Temporizador (Sleep Timer):** Multiplica la
-///    ganancia final por el factor del temporizador para bajar suavemente el
-///    volumen durante los últimos segundos antes de detener la música.
+/// Cómo evita cualquier micro-corte:
+/// - **Nunca** busca, pausa ni reasigna la canción que está terminando.
+/// - Precarga la **siguiente canción** desde `0:00` en el deck en espera unos
+///   segundos antes del cruce (con volumen `0.0`).
+/// - Al entrar en los últimos `N` segundos, inicia el deck en espera desde
+///   `0:00` en silencio (`0.0`), intercambia cuál es el deck activo y aplica
+///   la curva equal-power (`cos` bajando en la saliente, `sin` subiendo en la
+///   entrante).
+/// - Al concluir el cruce, la canción nueva **permanece** en ese mismo deck
+///   hasta su propio final: cero traspasos, cero micro-cortes.
 final class CrossfadeEngine {
   CrossfadeEngine({
-    required AudioPlayer primaryPlayer,
-    required Uri? Function() resolveCurrentTrackUri,
+    required EqualizerEngine equalizerEngine,
     required String? Function() resolveCurrentTrackKey,
-    required bool Function() canAdvanceToNext,
-    required Future<void> Function() advanceToNext,
+    required NextTrackCandidate? Function() resolveNextTrack,
+    required void Function(NextTrackCandidate next, AudioPlayer newActiveDeck)
+    onCrossfadeStarted,
+    required Future<void> Function() onActiveTrackCompleted,
+    required void Function(AudioPlayer activeDeck) onActiveDeckChanged,
     bool Function()? isCrossfadeSuppressed,
     PlaybackTransitionSettings? settings,
-  })  : _primaryPlayer = primaryPlayer,
-        _resolveCurrentTrackUri = resolveCurrentTrackUri,
+  })  : _equalizerEngine = equalizerEngine,
         _resolveCurrentTrackKey = resolveCurrentTrackKey,
-        _canAdvanceToNext = canAdvanceToNext,
-        _advanceToNext = advanceToNext,
+        _resolveNextTrack = resolveNextTrack,
+        _onCrossfadeStarted = onCrossfadeStarted,
+        _onActiveTrackCompleted = onActiveTrackCompleted,
+        _onActiveDeckChanged = onActiveDeckChanged,
         _isCrossfadeSuppressed = isCrossfadeSuppressed,
         _settings = settings ?? PlaybackTransitionSettings.instance {
-    _positionSub = _primaryPlayer.positionStream.listen(_onPrimaryPosition);
+    final slotA = _equalizerEngine.createDeckPipeline();
+    final slotB = _equalizerEngine.createDeckPipeline();
+    _slotIndexA = slotA.slotIndex;
+    _slotIndexB = slotB.slotIndex;
+
+    _deckA = AudioPlayer(audioPipeline: slotA.pipeline);
+    _deckB = AudioPlayer(audioPipeline: slotB.pipeline);
+
+    _bindActiveDeckListeners();
     _settings.crossfadeSeconds.addListener(_onCrossfadeSettingChanged);
   }
 
-  static const Duration _fadeTickInterval = Duration(milliseconds: 40);
-  static const Duration _preloadLeadTime = Duration(milliseconds: 2500);
+  static const Duration _fadeTickInterval = Duration(milliseconds: 35);
+  static const Duration _preloadLeadTime = Duration(milliseconds: 3000);
   static const int _minTrackDurationFloorSeconds = 10;
 
-  final AudioPlayer _primaryPlayer;
-  final Uri? Function() _resolveCurrentTrackUri;
+  final EqualizerEngine _equalizerEngine;
   final String? Function() _resolveCurrentTrackKey;
-  final bool Function() _canAdvanceToNext;
-  final Future<void> Function() _advanceToNext;
+  final NextTrackCandidate? Function() _resolveNextTrack;
+  final void Function(NextTrackCandidate next, AudioPlayer newActiveDeck)
+  _onCrossfadeStarted;
+  final Future<void> Function() _onActiveTrackCompleted;
+  final void Function(AudioPlayer activeDeck) _onActiveDeckChanged;
   final bool Function()? _isCrossfadeSuppressed;
   final PlaybackTransitionSettings _settings;
 
-  AudioPlayer? _outgoingPlayer;
-  StreamSubscription<Duration>? _positionSub;
+  late final AudioPlayer _deckA;
+  late final AudioPlayer _deckB;
+  late final int _slotIndexA;
+  late final int _slotIndexB;
+
+  int _activeDeckIndex = 0; // 0 = _deckA, 1 = _deckB
+
+  StreamSubscription<Duration>? _activePositionSub;
+  StreamSubscription<ProcessingState>? _activeProcessingSub;
   Timer? _crossfadeTimer;
 
-  // Monotónico: cualquier cambio de volumen/estado invalida rampas anteriores.
+  // Monotónico: cualquier acción manual invalida rampas o crossfades previos.
   int _volumeEpoch = 0;
 
-  // Estado de precarga y transición para evitar disparos duplicados por pista.
+  // Estado de precarga del deck en espera (para la SIGUIENTE canción).
   String? _preloadedTrackKey;
   Uri? _preloadedTrackUri;
   bool _isPreloading = false;
+
+  // Estado de transición en curso.
   bool _isCrossfading = false;
   bool _isFadingOutToPause = false;
-  String? _triggeredTrackKey;
+  bool _handlingCompletion = false;
+  String? _triggeredFromTrackKey;
 
-  // Ganancias independientes combinadas al aplicar volumen en _primaryPlayer.
-  double _primaryBaseVolume = 1.0;
+  // Ganancias base independientes por deck + factor global del Sleep Timer.
+  double _activeBaseVolume = 1.0;
   double _outgoingBaseVolume = 0.0;
   double _sleepTimerFactor = 1.0;
   bool _disposed = false;
 
-  /// Crea bajo demanda el deck auxiliar sin interferir con el AudioFocus ni
-  /// las interrupciones del sistema (de las que se encarga [_primaryPlayer]).
-  AudioPlayer _ensureOutgoingPlayer() {
-    return _outgoingPlayer ??= AudioPlayer(
-      handleInterruptions: false,
-      androidApplyAudioAttributes: false,
-      handleAudioSessionActivation: false,
+  /// Reproductor actualmente visible en UI, barra de progreso y notificación.
+  AudioPlayer get activePlayer => _activeDeckIndex == 0 ? _deckA : _deckB;
+
+  /// Reproductor secundario (en espera para precarga o desvaneciendo la pista
+  /// saliente durante un crossfade).
+  AudioPlayer get standbyPlayer => _activeDeckIndex == 0 ? _deckB : _deckA;
+
+  int get _activeSlotIndex => _activeDeckIndex == 0 ? _slotIndexA : _slotIndexB;
+  int get _standbySlotIndex =>
+      _activeDeckIndex == 0 ? _slotIndexB : _slotIndexA;
+
+  /// Indica si el crossfade acaba de precargar exactamente [candidate] en el
+  /// deck en espera, listo para iniciar al instante.
+  bool hasPreloadedCandidate(NextTrackCandidate candidate) =>
+      !_isCrossfading &&
+      _preloadedTrackKey == candidate.trackKey &&
+      _preloadedTrackUri == candidate.uri;
+
+  void _bindActiveDeckListeners() {
+    unawaited(_activePositionSub?.cancel());
+    unawaited(_activeProcessingSub?.cancel());
+
+    final currentDeck = activePlayer;
+    _activePositionSub = currentDeck.positionStream.listen(_onActivePosition);
+    _activeProcessingSub = currentDeck.processingStateStream.listen((state) {
+      if (_disposed || currentDeck != activePlayer) return;
+      if (state == ProcessingState.completed &&
+          !_isCrossfading &&
+          !_handlingCompletion) {
+        _handlingCompletion = true;
+        unawaited(
+          _onActiveTrackCompleted()
+              .catchError((Object e, StackTrace s) {
+                debugPrint('Error avanzando al completar pista: $e\n$s');
+              })
+              .whenComplete(() => _handlingCompletion = false),
+        );
+      }
+    });
+  }
+
+  /// Carga una pista en el deck activo para reproducción directa (al tocar una
+  /// canción, saltar siguiente/anterior o abrir una playlist) y cancela
+  /// limpiamente cualquier crossfade anterior.
+  Future<void> loadAndPlayOnActiveDeck(
+    Uri uri, {
+    required bool autoPlay,
+    bool smoothFadeIn = false,
+  }) async {
+    if (_disposed) return;
+    final epoch = ++_volumeEpoch;
+    _cancelCrossfadeTimerOnly();
+    _isCrossfading = false;
+    _isFadingOutToPause = false;
+    _triggeredFromTrackKey = null;
+    _clearPreloadCache();
+
+    await _stopStandbyDeckSafely();
+    if (_disposed || epoch != _volumeEpoch) return;
+
+    final deck = activePlayer;
+    final useFadeIn =
+        autoPlay && smoothFadeIn && _settings.smoothPlayPauseFade.value;
+    _activeBaseVolume = useFadeIn ? 0.0 : 1.0;
+    await deck.setVolume(_effectiveActiveVolume());
+    await deck.setAudioSource(AudioSource.uri(uri), initialPosition: Duration.zero);
+    _equalizerEngine.attachDeckSlot(_activeSlotIndex);
+
+    if (_disposed || epoch != _volumeEpoch) return;
+
+    if (autoPlay) {
+      unawaited(
+        deck.play().catchError((Object e, StackTrace s) {
+          debugPrint('Error iniciando reproducción en deck activo: $e\n$s');
+        }),
+      );
+      if (useFadeIn) {
+        await _rampActiveVolume(
+          from: 0.0,
+          to: 1.0,
+          duration: PlaybackTransitionSettings.playPauseFadeDuration,
+          epoch: epoch,
+        );
+      }
+    }
+  }
+
+  /// Intercambia instantáneamente al deck en espera cuando ya tiene precargada
+  /// la siguiente pista (usado en cambios naturales con crossfade en `0 s` para
+  /// lograr una transición prácticamente sin espacio).
+  Future<bool> switchToPreloadedStandby({
+    required NextTrackCandidate expected,
+    required bool autoPlay,
+  }) async {
+    if (_disposed || !hasPreloadedCandidate(expected)) return false;
+    final epoch = ++_volumeEpoch;
+    _cancelCrossfadeTimerOnly();
+    _isCrossfading = false;
+    _isFadingOutToPause = false;
+    _triggeredFromTrackKey = null;
+
+    final previousActive = activePlayer;
+    final incomingDeck = standbyPlayer;
+
+    _activeDeckIndex = _activeDeckIndex == 0 ? 1 : 0;
+    _clearPreloadCache();
+
+    _activeBaseVolume = 1.0;
+    await incomingDeck.setVolume(_effectiveActiveVolume());
+    await incomingDeck.seek(Duration.zero);
+
+    _bindActiveDeckListeners();
+    _onActiveDeckChanged(incomingDeck);
+
+    if (autoPlay && !_disposed && epoch == _volumeEpoch) {
+      unawaited(
+        incomingDeck.play().catchError((Object e, StackTrace s) {
+          debugPrint('Error iniciando deck precargado: $e\n$s');
+        }),
+      );
+    }
+
+    // Detener el deck anterior sin bloquear el inicio del nuevo.
+    unawaited(
+      previousActive.stop().catchError((Object e, StackTrace s) {
+        debugPrint('Error deteniendo deck anterior: $e\n$s');
+      }),
     );
+    return true;
+  }
+
+  /// Invalida la precarga si el usuario reordenó, eliminó o cambió la cola.
+  void invalidatePreload() {
+    if (_isCrossfading) return;
+    _clearPreloadCache();
+  }
+
+  void _clearPreloadCache() {
+    _preloadedTrackKey = null;
+    _preloadedTrackUri = null;
   }
 
   void _onCrossfadeSettingChanged() {
@@ -96,17 +276,43 @@ final class CrossfadeEngine {
     }
   }
 
-  void _onPrimaryPosition(Duration position) {
+  void _onActivePosition(Duration position) {
     if (_disposed || _isCrossfading || _isFadingOutToPause) return;
 
-    final crossfadeSecs = _settings.crossfadeSeconds.value;
-    if (crossfadeSecs <= 0) return;
-    if (_isCrossfadeSuppressed?.call() ?? false) return;
-    if (!_primaryPlayer.playing) return;
-    if (!_canAdvanceToNext()) return;
+    final deck = activePlayer;
+    if (!deck.playing) return;
 
-    final duration = _primaryPlayer.duration;
+    final duration = deck.duration;
     if (duration == null || duration <= Duration.zero) return;
+
+    final currentKey = _resolveCurrentTrackKey();
+    if (currentKey == null || currentKey.isEmpty) return;
+
+    final crossfadeSecs = _settings.crossfadeSeconds.value;
+    final suppressed = _isCrossfadeSuppressed?.call() ?? false;
+    final remaining = duration - position;
+
+    // 1. Precargar la SIGUIENTE canción en el deck en espera ~3s antes del
+    //    punto de cruce (o 3s antes del final si crossfade == 0).
+    //    Esto no toca en absoluto la canción que está sonando.
+    final preloadThreshold = Duration(seconds: crossfadeSecs) + _preloadLeadTime;
+    if (!suppressed &&
+        remaining <= preloadThreshold &&
+        remaining > const Duration(milliseconds: 300) &&
+        !_isPreloading) {
+      final next = _resolveNextTrack();
+      if (next != null &&
+          (_preloadedTrackKey != next.trackKey ||
+              _preloadedTrackUri != next.uri)) {
+        unawaited(
+          _preloadNextOnStandby(next).catchError((Object e, StackTrace s) {
+            debugPrint('Error precargando siguiente pista: $e\n$s');
+          }),
+        );
+      }
+    }
+
+    if (crossfadeSecs <= 0 || suppressed) return;
 
     // Resguardar pistas muy cortas para que no disparen crossfade inmediato.
     final minRequiredSecs = (crossfadeSecs * 2).clamp(
@@ -115,78 +321,65 @@ final class CrossfadeEngine {
     );
     if (duration.inSeconds < minRequiredSecs) return;
 
-    final trackKey = _resolveCurrentTrackKey();
-    if (trackKey == null || trackKey.isEmpty) return;
-
-    // Si el usuario retrocedió la barra lejos del final, permitir nuevo trigger.
     final crossfadeDuration = Duration(seconds: crossfadeSecs);
-    final remaining = duration - position;
-    if (_triggeredTrackKey == trackKey &&
+
+    // Si el usuario retrocedió el scrubber lejos del final, re-armar trigger.
+    if (_triggeredFromTrackKey == currentKey &&
         remaining > crossfadeDuration + const Duration(seconds: 2)) {
-      _triggeredTrackKey = null;
+      _triggeredFromTrackKey = null;
     }
 
-    if (_triggeredTrackKey == trackKey) return;
+    if (_triggeredFromTrackKey == currentKey) return;
 
-    // 1. Precargar el archivo actual en el deck saliente ~2.5s antes del cruce
-    //    para que el traspaso de audio sea instantáneo sin latencia de lectura.
-    if (remaining <= crossfadeDuration + _preloadLeadTime &&
-        remaining > crossfadeDuration &&
-        _preloadedTrackKey != trackKey &&
-        !_isPreloading) {
-      final uri = _resolveCurrentTrackUri();
-      if (uri != null && uri.toString().isNotEmpty) {
-        unawaited(
-          _preloadOutgoingTrack(trackKey, uri).catchError((
-            Object e,
-            StackTrace s,
-          ) {
-            debugPrint('Error precargando pista saliente para crossfade: $e\n$s');
-          }),
-        );
-      }
-    }
-
-    // 2. Iniciar crossfade cuando entramos en los últimos `crossfadeSecs`.
+    // 2. Al entrar en los últimos `crossfadeSecs`: iniciar la SIGUIENTE canción
+    //    en el deck en espera desde 0:00 con volumen 0.0 mientras la canción
+    //    actual sigue sonando SIN INTERRUPCIÓN en su propio deck.
     if (remaining <= crossfadeDuration &&
-        remaining > const Duration(milliseconds: 250)) {
-      _triggeredTrackKey = trackKey;
+        remaining > const Duration(milliseconds: 300)) {
+      final next = _resolveNextTrack();
+      if (next == null) return;
+
+      _triggeredFromTrackKey = currentKey;
       final effectiveFade = remaining < crossfadeDuration
           ? remaining
           : crossfadeDuration;
       unawaited(
-        _runCrossfade(
-          outgoingTrackKey: trackKey,
+        _runTrueDualDeckCrossfade(
+          next: next,
           fadeDuration: effectiveFade,
         ).catchError((Object e, StackTrace s) {
-          debugPrint('Error durante crossfade: $e\n$s');
+          debugPrint('Error ejecutando crossfade dual-deck: $e\n$s');
         }),
       );
     }
   }
 
-  Future<void> _preloadOutgoingTrack(String trackKey, Uri uri) async {
-    if (_disposed || _isCrossfading) return;
+  Future<void> _preloadNextOnStandby(NextTrackCandidate candidate) async {
+    if (_disposed || _isCrossfading || _isPreloading) return;
     _isPreloading = true;
     try {
-      final deck = _ensureOutgoingPlayer();
+      final deck = standbyPlayer;
+      final slotIndex = _standbySlotIndex;
       await deck.stop();
       await deck.setVolume(0.0);
-      await deck.setAudioSource(AudioSource.uri(uri));
+      await deck.setAudioSource(
+        AudioSource.uri(candidate.uri),
+        initialPosition: Duration.zero,
+      );
+      _equalizerEngine.attachDeckSlot(slotIndex);
       if (_disposed) return;
-      _preloadedTrackKey = trackKey;
-      _preloadedTrackUri = uri;
+      _preloadedTrackKey = candidate.trackKey;
+      _preloadedTrackUri = candidate.uri;
     } on Exception catch (e, s) {
-      debugPrint('Precarga de crossfade omitida: $e\n$s');
-      _preloadedTrackKey = null;
-      _preloadedTrackUri = null;
+      debugPrint('Precarga en deck en espera omitida: $e\n$s');
+      _clearPreloadCache();
     } finally {
       _isPreloading = false;
     }
   }
 
-  Future<void> _runCrossfade({
-    required String outgoingTrackKey,
+  Future<void> _runTrueDualDeckCrossfade({
+    required NextTrackCandidate next,
     required Duration fadeDuration,
   }) async {
     if (_disposed || _isCrossfading) return;
@@ -194,146 +387,118 @@ final class CrossfadeEngine {
     final epoch = ++_volumeEpoch;
 
     try {
-      final uri = _resolveCurrentTrackUri();
-      final handoffReady = await _prepareOutgoingDeckForHandoff(
-        outgoingTrackKey: outgoingTrackKey,
-        uri: uri,
-      );
+      final outgoingDeck = activePlayer;
+      final incomingDeck = standbyPlayer;
+      final incomingSlot = _standbySlotIndex;
 
-      if (_disposed || epoch != _volumeEpoch || !_primaryPlayer.playing) {
-        _isCrossfading = false;
+      // Si el usuario cambió la cola a último momento o no dio tiempo a
+      // precargar, cargar la pista entrante AHORA en incomingDeck (en silencio)
+      // mientras outgoingDeck sigue sonando sin cortes.
+      if (_preloadedTrackKey != next.trackKey ||
+          _preloadedTrackUri != next.uri) {
+        await incomingDeck.stop();
+        await incomingDeck.setVolume(0.0);
+        await incomingDeck.setAudioSource(
+          AudioSource.uri(next.uri),
+          initialPosition: Duration.zero,
+        );
+        _equalizerEngine.attachDeckSlot(incomingSlot);
+      } else {
+        await incomingDeck.setVolume(0.0);
+        if (incomingDeck.position != Duration.zero) {
+          await incomingDeck.seek(Duration.zero);
+        }
+      }
+
+      if (_disposed || epoch != _volumeEpoch || !outgoingDeck.playing) {
         return;
       }
 
-      if (handoffReady) {
-        await _executeDualDeckCrossfade(
-          fadeDuration: fadeDuration,
-          epoch: epoch,
+      // Recalcular el tiempo real restante tras cualquier carga de último
+      // segundo para que la curva termine justo cuando acaba la pista saliente.
+      final outDuration = outgoingDeck.duration;
+      final actualRemaining = (outDuration != null && outDuration > Duration.zero)
+          ? outDuration - outgoingDeck.position
+          : fadeDuration;
+      final effectiveFadeMs =
+          (actualRemaining < fadeDuration ? actualRemaining : fadeDuration)
+              .inMilliseconds
+              .clamp(350, 15000);
+
+      // Arrancar la pista entrante desde 0:00 en silencio absoluto (0.0).
+      // La pista saliente NO se pausa, NO se busca y NO se interrumpe jamás.
+      _outgoingBaseVolume = _activeBaseVolume;
+      _activeBaseVolume = 0.0;
+      await incomingDeck.setVolume(0.0);
+      unawaited(
+        incomingDeck.play().catchError((Object e, StackTrace s) {
+          debugPrint('Error iniciando pista entrante en crossfade: $e\n$s');
+        }),
+      );
+
+      // Promover el deck entrante como deck activo (ping-pong) y avisar a la UI
+      // para que muestre la nueva carátula, título y barra desde 0:00.
+      _activeDeckIndex = _activeDeckIndex == 0 ? 1 : 0;
+      _clearPreloadCache();
+      _bindActiveDeckListeners();
+      _onActiveDeckChanged(incomingDeck);
+      _onCrossfadeStarted(next, incomingDeck);
+
+      // Rampa equal-power suave (coseno bajando saliente, seno subiendo entrante).
+      final completer = Completer<void>();
+      final stopwatch = Stopwatch()..start();
+
+      _crossfadeTimer?.cancel();
+      _crossfadeTimer = Timer.periodic(_fadeTickInterval, (timer) {
+        if (_disposed || epoch != _volumeEpoch) {
+          timer.cancel();
+          if (!completer.isCompleted) completer.complete();
+          return;
+        }
+
+        final t = (stopwatch.elapsedMilliseconds / effectiveFadeMs).clamp(
+          0.0,
+          1.0,
         );
-      } else {
-        await _executeFallbackSingleDeckFade(
-          fadeDuration: fadeDuration,
-          epoch: epoch,
+        _outgoingBaseVolume = CrossfadeCurve.outgoingGain(t);
+        _activeBaseVolume = CrossfadeCurve.incomingGain(t);
+
+        unawaited(
+          _applyDualVolumes(
+            activeDeck: incomingDeck,
+            outgoingDeck: outgoingDeck,
+          ).catchError((Object e, StackTrace s) {
+            debugPrint('Error aplicando volumen de crossfade: $e\n$s');
+          }),
         );
+
+        if (t >= 1.0) {
+          timer.cancel();
+          if (!completer.isCompleted) completer.complete();
+        }
+      });
+
+      await completer.future;
+
+      if (!_disposed && epoch == _volumeEpoch) {
+        _activeBaseVolume = 1.0;
+        _outgoingBaseVolume = 0.0;
+        await incomingDeck.setVolume(_effectiveActiveVolume());
+        await _stopDeckSafely(outgoingDeck);
+      }
+    } on Exception catch (e, s) {
+      debugPrint('Error en crossfade dual-deck: $e\n$s');
+      if (!_disposed && epoch == _volumeEpoch) {
+        _activeBaseVolume = 1.0;
+        _outgoingBaseVolume = 0.0;
+        await activePlayer.setVolume(_effectiveActiveVolume());
+        await _stopStandbyDeckSafely();
       }
     } finally {
       if (epoch == _volumeEpoch) {
         _isCrossfading = false;
       }
     }
-  }
-
-  Future<bool> _prepareOutgoingDeckForHandoff({
-    required String outgoingTrackKey,
-    required Uri? uri,
-  }) async {
-    if (uri == null || uri.toString().isEmpty) return false;
-    try {
-      final deck = _ensureOutgoingPlayer();
-      if (_preloadedTrackKey != outgoingTrackKey || _preloadedTrackUri != uri) {
-        await deck.stop();
-        await deck.setVolume(0.0);
-        await deck.setAudioSource(AudioSource.uri(uri));
-        _preloadedTrackKey = outgoingTrackKey;
-        _preloadedTrackUri = uri;
-      }
-      final handoffPos = _primaryPlayer.position;
-      await deck.seek(handoffPos);
-      return true;
-    } on Exception catch (e, s) {
-      debugPrint('Fallback de crossfade activado: $e\n$s');
-      return false;
-    }
-  }
-
-  Future<void> _executeDualDeckCrossfade({
-    required Duration fadeDuration,
-    required int epoch,
-  }) async {
-    final deck = _outgoingPlayer;
-    if (deck == null) return;
-
-    // Arrancar la pista saliente exactamente donde iba y mutear el deck
-    // principal justo antes de avanzar a la siguiente canción.
-    _outgoingBaseVolume = 1.0;
-    await deck.setVolume(_effectiveOutgoingVolume());
-    // No hacemos await de deck.play() porque `just_audio.play()` completa al
-    // finalizar la reproducción, no al iniciar.
-    unawaited(
-      deck.play().catchError((Object e, StackTrace s) {
-        debugPrint('Error reproduciendo deck saliente: $e\n$s');
-      }),
-    );
-
-    _primaryBaseVolume = 0.0;
-    await _applyPrimaryVolume();
-    await _advanceToNext();
-
-    if (_disposed || epoch != _volumeEpoch) {
-      await _stopOutgoingDeckSafely();
-      return;
-    }
-
-    if (!_primaryPlayer.playing) {
-      unawaited(
-        _primaryPlayer.play().catchError((Object e, StackTrace s) {
-          debugPrint('Error reanudando pista entrante en crossfade: $e\n$s');
-        }),
-      );
-    }
-
-    final completer = Completer<void>();
-    final stopwatch = Stopwatch()..start();
-    final totalMs = fadeDuration.inMilliseconds.clamp(300, 15000);
-
-    _crossfadeTimer?.cancel();
-    _crossfadeTimer = Timer.periodic(_fadeTickInterval, (timer) {
-      if (_disposed || epoch != _volumeEpoch) {
-        timer.cancel();
-        if (!completer.isCompleted) completer.complete();
-        return;
-      }
-
-      final t = (stopwatch.elapsedMilliseconds / totalMs).clamp(0.0, 1.0);
-      _outgoingBaseVolume = CrossfadeCurve.outgoingGain(t);
-      _primaryBaseVolume = CrossfadeCurve.incomingGain(t);
-
-      unawaited(
-        _applyDualVolumes().catchError((Object e, StackTrace s) {
-          debugPrint('Error aplicando volumen de crossfade: $e\n$s');
-        }),
-      );
-
-      if (t >= 1.0) {
-        timer.cancel();
-        if (!completer.isCompleted) completer.complete();
-      }
-    });
-
-    await completer.future;
-
-    if (!_disposed && epoch == _volumeEpoch) {
-      _primaryBaseVolume = 1.0;
-      _outgoingBaseVolume = 0.0;
-      await _applyPrimaryVolume();
-      await _stopOutgoingDeckSafely();
-    }
-  }
-
-  /// Fallback ultra-seguro si un archivo no pudo cargarse en el deck auxiliar:
-  /// atenúa la canción actual, avanza a la siguiente y sube el volumen.
-  Future<void> _executeFallbackSingleDeckFade({
-    required Duration fadeDuration,
-    required int epoch,
-  }) async {
-    final half = Duration(
-      milliseconds: (fadeDuration.inMilliseconds ~/ 2).clamp(200, 3000),
-    );
-    await _rampPrimaryVolume(from: _primaryBaseVolume, to: 0.0, duration: half, epoch: epoch);
-    if (_disposed || epoch != _volumeEpoch) return;
-    await _advanceToNext();
-    if (_disposed || epoch != _volumeEpoch) return;
-    await _rampPrimaryVolume(from: 0.0, to: 1.0, duration: half, epoch: epoch);
   }
 
   /// Reanuda la reproducción con fundido de entrada suave si está habilitado.
@@ -343,13 +508,14 @@ final class CrossfadeEngine {
     _cancelCrossfadeTimerOnly();
     _isCrossfading = false;
     _isFadingOutToPause = false;
-    await _stopOutgoingDeckSafely();
+    await _stopStandbyDeckSafely();
 
+    final deck = activePlayer;
     if (!_settings.smoothPlayPauseFade.value) {
-      _primaryBaseVolume = 1.0;
-      await _applyPrimaryVolume();
+      _activeBaseVolume = 1.0;
+      await deck.setVolume(_effectiveActiveVolume());
       unawaited(
-        _primaryPlayer.play().catchError((Object e, StackTrace s) {
+        deck.play().catchError((Object e, StackTrace s) {
           debugPrint('Error en play(): $e\n$s');
         }),
       );
@@ -358,19 +524,19 @@ final class CrossfadeEngine {
 
     // Si ya estaba sonando (p. ej. el usuario canceló una pausa a mitad del
     // fade-out), subimos desde el volumen actual hacia 1.0 sin cortes.
-    final startVol = _primaryPlayer.playing ? _primaryBaseVolume : 0.0;
-    _primaryBaseVolume = startVol;
-    await _applyPrimaryVolume();
+    final startVol = deck.playing ? _activeBaseVolume : 0.0;
+    _activeBaseVolume = startVol;
+    await deck.setVolume(_effectiveActiveVolume());
 
-    if (!_primaryPlayer.playing) {
+    if (!deck.playing) {
       unawaited(
-        _primaryPlayer.play().catchError((Object e, StackTrace s) {
+        deck.play().catchError((Object e, StackTrace s) {
           debugPrint('Error iniciando reproducción con fade: $e\n$s');
         }),
       );
     }
 
-    await _rampPrimaryVolume(
+    await _rampActiveVolume(
       from: startVol,
       to: 1.0,
       duration: PlaybackTransitionSettings.playPauseFadeDuration,
@@ -393,21 +559,24 @@ final class CrossfadeEngine {
     _cancelCrossfadeTimerOnly();
     _isCrossfading = false;
 
-    if (!_settings.smoothPlayPauseFade.value || !_primaryPlayer.playing) {
-      await _stopOutgoingDeckSafely();
-      await _primaryPlayer.pause();
+    final deck = activePlayer;
+    final outgoing = standbyPlayer;
+
+    if (!_settings.smoothPlayPauseFade.value || !deck.playing) {
+      await _stopStandbyDeckSafely();
+      await deck.pause();
       if (!_disposed && epoch == _volumeEpoch) {
-        _primaryBaseVolume = 1.0;
-        await _applyPrimaryVolume();
+        _activeBaseVolume = 1.0;
+        await deck.setVolume(_effectiveActiveVolume());
       }
       return;
     }
 
     _isFadingOutToPause = true;
     try {
-      final startPrimary = _primaryBaseVolume;
+      final startActive = _activeBaseVolume;
       final startOutgoing = _outgoingBaseVolume;
-      final hasOutgoing = _outgoingPlayer?.playing ?? false;
+      final hasOutgoing = outgoing.playing;
 
       final stopwatch = Stopwatch()..start();
       final totalMs =
@@ -415,15 +584,15 @@ final class CrossfadeEngine {
 
       while (!_disposed && epoch == _volumeEpoch) {
         final t = (stopwatch.elapsedMilliseconds / totalMs).clamp(0.0, 1.0);
-        _primaryBaseVolume = CrossfadeCurve.smoothRamp(startPrimary, 0.0, t);
-        await _applyPrimaryVolume();
+        _activeBaseVolume = CrossfadeCurve.smoothRamp(startActive, 0.0, t);
+        await deck.setVolume(_effectiveActiveVolume());
         if (hasOutgoing) {
           _outgoingBaseVolume = CrossfadeCurve.smoothRamp(
             startOutgoing,
             0.0,
             t,
           );
-          await _outgoingPlayer?.setVolume(_effectiveOutgoingVolume());
+          await outgoing.setVolume(_effectiveOutgoingVolume());
         }
         if (t >= 1.0) break;
         await Future<void>.delayed(_fadeTickInterval);
@@ -431,14 +600,14 @@ final class CrossfadeEngine {
 
       if (_disposed || epoch != _volumeEpoch) return;
 
-      await _stopOutgoingDeckSafely();
-      await _primaryPlayer.pause();
+      await _stopStandbyDeckSafely();
+      await deck.pause();
 
       // Restaurar ganancia base a 1.0 mientras está en pausa para que cualquier
       // reanudación externa (ej. Bluetooth o sistema) nunca quede muda.
-      if (!_disposed && epoch == _volumeEpoch && !_primaryPlayer.playing) {
-        _primaryBaseVolume = 1.0;
-        await _applyPrimaryVolume();
+      if (!_disposed && epoch == _volumeEpoch && !deck.playing) {
+        _activeBaseVolume = 1.0;
+        await deck.setVolume(_effectiveActiveVolume());
       }
     } finally {
       if (epoch == _volumeEpoch) {
@@ -454,7 +623,10 @@ final class CrossfadeEngine {
     final clamped = factor.clamp(0.0, 1.0);
     if ((_sleepTimerFactor - clamped).abs() < 0.002) return;
     _sleepTimerFactor = clamped;
-    await _applyDualVolumes();
+    await _applyDualVolumes(
+      activeDeck: activePlayer,
+      outgoingDeck: standbyPlayer,
+    );
   }
 
   /// Pausa la reproducción al concluir la atenuación del Temporizador y
@@ -464,12 +636,13 @@ final class CrossfadeEngine {
     final epoch = ++_volumeEpoch;
     _cancelCrossfadeTimerOnly();
     _isCrossfading = false;
-    await _stopOutgoingDeckSafely();
-    await _primaryPlayer.pause();
+    _isFadingOutToPause = false;
+    await _stopStandbyDeckSafely();
+    await activePlayer.pause();
     if (!_disposed && epoch == _volumeEpoch) {
       _sleepTimerFactor = 1.0;
-      _primaryBaseVolume = 1.0;
-      await _applyPrimaryVolume();
+      _activeBaseVolume = 1.0;
+      await activePlayer.setVolume(_effectiveActiveVolume());
     }
   }
 
@@ -486,14 +659,20 @@ final class CrossfadeEngine {
     while (!_disposed && epoch == _volumeEpoch) {
       final t = (stopwatch.elapsedMilliseconds / durationMs).clamp(0.0, 1.0);
       _sleepTimerFactor = CrossfadeCurve.smoothRamp(startFactor, 1.0, t);
-      await _applyDualVolumes();
+      await _applyDualVolumes(
+        activeDeck: activePlayer,
+        outgoingDeck: standbyPlayer,
+      );
       if (t >= 1.0) break;
       await Future<void>.delayed(_fadeTickInterval);
     }
 
     if (!_disposed && epoch == _volumeEpoch) {
       _sleepTimerFactor = 1.0;
-      await _applyDualVolumes();
+      await _applyDualVolumes(
+        activeDeck: activePlayer,
+        outgoingDeck: standbyPlayer,
+      );
     }
   }
 
@@ -505,56 +684,60 @@ final class CrossfadeEngine {
     _cancelCrossfadeTimerOnly();
     _isCrossfading = false;
     _isFadingOutToPause = false;
-    _triggeredTrackKey = null;
-    _preloadedTrackKey = null;
-    _preloadedTrackUri = null;
-    await _stopOutgoingDeckSafely();
+    _triggeredFromTrackKey = null;
+    _clearPreloadCache();
+    await _stopStandbyDeckSafely();
     if (restoreVolume) {
-      _primaryBaseVolume = 1.0;
-      await _applyPrimaryVolume();
+      _activeBaseVolume = 1.0;
+      await activePlayer.setVolume(_effectiveActiveVolume());
     }
   }
 
-  Future<void> _rampPrimaryVolume({
+  /// Detiene ambos decks por completo.
+  Future<void> stopBothDecks() async {
+    if (_disposed) return;
+    await cancelActiveTransition(restoreVolume: true);
+    await activePlayer.stop();
+  }
+
+  Future<void> _rampActiveVolume({
     required double from,
     required double to,
     required Duration duration,
     required int epoch,
   }) async {
     final totalMs = duration.inMilliseconds;
+    final deck = activePlayer;
     if (totalMs <= 0) {
-      _primaryBaseVolume = to;
-      await _applyPrimaryVolume();
+      _activeBaseVolume = to;
+      await deck.setVolume(_effectiveActiveVolume());
       return;
     }
 
     final stopwatch = Stopwatch()..start();
     while (!_disposed && epoch == _volumeEpoch) {
       final t = (stopwatch.elapsedMilliseconds / totalMs).clamp(0.0, 1.0);
-      _primaryBaseVolume = CrossfadeCurve.smoothRamp(from, to, t);
-      await _applyPrimaryVolume();
+      _activeBaseVolume = CrossfadeCurve.smoothRamp(from, to, t);
+      await deck.setVolume(_effectiveActiveVolume());
       if (t >= 1.0) break;
       await Future<void>.delayed(_fadeTickInterval);
     }
   }
 
-  double _effectivePrimaryVolume() =>
-      (_primaryBaseVolume * _sleepTimerFactor).clamp(0.0, 1.0);
+  double _effectiveActiveVolume() =>
+      (_activeBaseVolume * _sleepTimerFactor).clamp(0.0, 1.0);
 
   double _effectiveOutgoingVolume() =>
       (_outgoingBaseVolume * _sleepTimerFactor).clamp(0.0, 1.0);
 
-  Future<void> _applyPrimaryVolume() async {
+  Future<void> _applyDualVolumes({
+    required AudioPlayer activeDeck,
+    required AudioPlayer outgoingDeck,
+  }) async {
     if (_disposed) return;
-    await _primaryPlayer.setVolume(_effectivePrimaryVolume());
-  }
-
-  Future<void> _applyDualVolumes() async {
-    if (_disposed) return;
-    await _primaryPlayer.setVolume(_effectivePrimaryVolume());
-    final deck = _outgoingPlayer;
-    if (deck != null && deck.playing) {
-      await deck.setVolume(_effectiveOutgoingVolume());
+    await activeDeck.setVolume(_effectiveActiveVolume());
+    if (outgoingDeck.playing) {
+      await outgoingDeck.setVolume(_effectiveOutgoingVolume());
     }
   }
 
@@ -563,27 +746,31 @@ final class CrossfadeEngine {
     _crossfadeTimer = null;
   }
 
-  Future<void> _stopOutgoingDeckSafely() async {
+  Future<void> _stopStandbyDeckSafely() async {
     _outgoingBaseVolume = 0.0;
-    final deck = _outgoingPlayer;
-    if (deck == null) return;
+    await _stopDeckSafely(standbyPlayer);
+  }
+
+  Future<void> _stopDeckSafely(AudioPlayer deck) async {
     try {
       await deck.stop();
       await deck.setVolume(0.0);
     } on Exception catch (e, s) {
-      debugPrint('Error deteniendo deck saliente: $e\n$s');
+      debugPrint('Error deteniendo deck auxiliar: $e\n$s');
     }
   }
 
-  /// Libera suscripciones, temporizadores y el reproductor auxiliar.
+  /// Libera suscripciones, temporizadores y ambos decks de audio.
   Future<void> dispose() async {
     _disposed = true;
     _volumeEpoch++;
     _cancelCrossfadeTimerOnly();
     _settings.crossfadeSeconds.removeListener(_onCrossfadeSettingChanged);
-    await _positionSub?.cancel();
-    _positionSub = null;
-    await _outgoingPlayer?.dispose();
-    _outgoingPlayer = null;
+    await _activePositionSub?.cancel();
+    await _activeProcessingSub?.cancel();
+    _activePositionSub = null;
+    _activeProcessingSub = null;
+    await _deckA.dispose();
+    await _deckB.dispose();
   }
 }

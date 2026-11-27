@@ -5,29 +5,31 @@ import 'package:just_audio/just_audio.dart';
 
 import 'equalizer_settings.dart';
 
+final class _DeckEffectSlot {
+  _DeckEffectSlot({
+    required this.pipeline,
+    required this.equalizer,
+    required this.loudnessEnhancer,
+  });
+
+  final AudioPipeline pipeline;
+  final AndroidEqualizer? equalizer;
+  final AndroidLoudnessEnhancer? loudnessEnhancer;
+  AndroidEqualizerParameters? cachedParameters;
+  bool parametersWatchStarted = false;
+}
+
 /// Motor nativo de ecualización y potenciador de volumen sobre el
 /// [AudioPipeline] de `just_audio` (`AndroidEqualizer` + `AndroidLoudnessEnhancer`).
 ///
-/// Escucha [EqualizerSettings] y sincroniza cada cambio en tiempo real con el
-/// hardware de Android de forma segura (sin bloquear ni fallar en plataformas
-/// no Android o antes de que se cargue la primera pista).
+/// Soporta múltiples decks (Deck A y Deck B del motor de crossfade dual-deck)
+/// manteniendo exactamente la misma curva de ecualización y loudness en ambos
+/// reproductores para que el cruce sea tonalmente invisible.
 final class EqualizerEngine {
   EqualizerEngine({EqualizerSettings? settings})
     : _settings = settings ?? EqualizerSettings.instance {
     _isAndroidRuntime =
         !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
-
-    if (_isAndroidRuntime) {
-      _equalizer = AndroidEqualizer();
-      _loudnessEnhancer = AndroidLoudnessEnhancer();
-      pipeline = AudioPipeline(
-        androidAudioEffects: [_equalizer!, _loudnessEnhancer!],
-      );
-    } else {
-      _equalizer = null;
-      _loudnessEnhancer = null;
-      pipeline = AudioPipeline();
-    }
 
     _settings.enabled.addListener(_scheduleSync);
     _settings.bandLevels.addListener(_scheduleSync);
@@ -37,35 +39,54 @@ final class EqualizerEngine {
 
   final EqualizerSettings _settings;
   late final bool _isAndroidRuntime;
-  late final AndroidEqualizer? _equalizer;
-  late final AndroidLoudnessEnhancer? _loudnessEnhancer;
-
-  /// Pipeline que debe entregarse al constructor de `AudioPlayer`.
-  late final AudioPipeline pipeline;
+  final List<_DeckEffectSlot> _slots = [];
 
   /// Frecuencias centrales reales reportadas por el hardware del teléfono
   /// (por defecto las 5 frecuencias estándar de Android).
   final ValueNotifier<List<double>> centerFrequenciesHz =
       ValueNotifier<List<double>>(EqualizerMath.defaultCenterFrequenciesHz);
 
-  AndroidEqualizerParameters? _cachedParameters;
-  bool _parametersWatchStarted = false;
   bool _disposed = false;
   bool _syncRunning = false;
   bool _syncPending = false;
 
-  /// Debe llamarse una vez que `AudioPlayer.setAudioSource(...)` haya activado
-  /// el motor nativo para leer las bandas reales y aplicar el estado guardado.
-  void attachToActivePlayer() {
-    if (_disposed || !_isAndroidRuntime) return;
+  /// Crea y registra un [AudioPipeline] independiente para un deck de audio
+  /// (Deck A o Deck B), devolviendo su índice de slot y pipeline.
+  ({int slotIndex, AudioPipeline pipeline}) createDeckPipeline() {
+    final AndroidEqualizer? eq = _isAndroidRuntime ? AndroidEqualizer() : null;
+    final AndroidLoudnessEnhancer? loudness = _isAndroidRuntime
+        ? AndroidLoudnessEnhancer()
+        : null;
+    final pipeline = _isAndroidRuntime
+        ? AudioPipeline(androidAudioEffects: [eq!, loudness!])
+        : AudioPipeline();
 
-    if (!_parametersWatchStarted && _equalizer != null) {
-      _parametersWatchStarted = true;
+    final slotIndex = _slots.length;
+    _slots.add(
+      _DeckEffectSlot(
+        pipeline: pipeline,
+        equalizer: eq,
+        loudnessEnhancer: loudness,
+      ),
+    );
+    return (slotIndex: slotIndex, pipeline: pipeline);
+  }
+
+  /// Debe llamarse cuando el deck [slotIndex] haya cargado una fuente de audio
+  /// para capturar sus bandas reales y sincronizar el estado guardado.
+  void attachDeckSlot(int slotIndex) {
+    if (_disposed || !_isAndroidRuntime) return;
+    if (slotIndex < 0 || slotIndex >= _slots.length) return;
+
+    final slot = _slots[slotIndex];
+    final eq = slot.equalizer;
+    if (!slot.parametersWatchStarted && eq != null) {
+      slot.parametersWatchStarted = true;
       unawaited(
-        _equalizer.parameters
+        eq.parameters
             .then((params) {
               if (_disposed) return;
-              _cachedParameters = params;
+              slot.cachedParameters = params;
               if (params.bands.length == EqualizerSettings.bandCount) {
                 centerFrequenciesHz.value = List<double>.unmodifiable(
                   params.bands.map((b) => b.centerFrequency),
@@ -74,7 +95,9 @@ final class EqualizerEngine {
               _scheduleSync();
             })
             .catchError((Object e, StackTrace s) {
-              debugPrint('Error leyendo parámetros de AndroidEqualizer: $e\n$s');
+              debugPrint(
+                'Error leyendo parámetros de AndroidEqualizer (slot $slotIndex): $e\n$s',
+              );
             }),
       );
     }
@@ -96,7 +119,7 @@ final class EqualizerEngine {
     try {
       while (!_disposed && _syncPending) {
         _syncPending = false;
-        await _applySettingsToHardware();
+        await _applySettingsToAllSlots();
       }
     } on Exception catch (e, s) {
       debugPrint('Error sincronizando ecualizador con hardware: $e\n$s');
@@ -105,48 +128,51 @@ final class EqualizerEngine {
     }
   }
 
-  Future<void> _applySettingsToHardware() async {
+  Future<void> _applySettingsToAllSlots() async {
     if (_disposed || !_isAndroidRuntime) return;
 
-    final eq = _equalizer;
-    final loudness = _loudnessEnhancer;
     final isEnabled = _settings.enabled.value;
+    final effectiveFive = _settings.effectiveBandLevels();
+    final boostDb = _settings.loudnessBoostDb.value;
+    final loudnessActive = isEnabled && boostDb >= 0.1;
+    final targetGain = loudnessActive
+        ? EqualizerMath.loudnessDbToJustAudioTargetGain(boostDb)
+        : 0.0;
 
-    if (eq != null) {
-      try {
-        await eq.setEnabled(isEnabled);
-        final params = _cachedParameters;
-        if (params != null && params.bands.isNotEmpty) {
-          final effectiveFive = _settings.effectiveBandLevels();
-          final deviceLevels = EqualizerMath.resampleNormalizedBands(
-            effectiveFive,
-            params.bands.length,
-          );
-          for (var i = 0; i < params.bands.length; i++) {
-            final gain = EqualizerMath.mapNormalizedToDeviceGain(
-              normalized: deviceLevels[i],
-              minDevice: params.minDecibels,
-              maxDevice: params.maxDecibels,
+    for (final slot in _slots) {
+      if (_disposed) return;
+      final eq = slot.equalizer;
+      if (eq != null) {
+        try {
+          await eq.setEnabled(isEnabled);
+          final params = slot.cachedParameters;
+          if (params != null && params.bands.isNotEmpty) {
+            final deviceLevels = EqualizerMath.resampleNormalizedBands(
+              effectiveFive,
+              params.bands.length,
             );
-            await params.bands[i].setGain(gain);
+            for (var i = 0; i < params.bands.length; i++) {
+              final gain = EqualizerMath.mapNormalizedToDeviceGain(
+                normalized: deviceLevels[i],
+                minDevice: params.minDecibels,
+                maxDevice: params.maxDecibels,
+              );
+              await params.bands[i].setGain(gain);
+            }
           }
+        } on Exception catch (e, s) {
+          debugPrint('Error aplicando bandas de AndroidEqualizer: $e\n$s');
         }
-      } on Exception catch (e, s) {
-        debugPrint('Error aplicando bandas de AndroidEqualizer: $e\n$s');
       }
-    }
 
-    if (loudness != null) {
-      try {
-        final boostDb = _settings.loudnessBoostDb.value;
-        final loudnessActive = isEnabled && boostDb >= 0.1;
-        await loudness.setEnabled(loudnessActive);
-        final targetGain = loudnessActive
-            ? EqualizerMath.loudnessDbToJustAudioTargetGain(boostDb)
-            : 0.0;
-        await loudness.setTargetGain(targetGain);
-      } on Exception catch (e, s) {
-        debugPrint('Error aplicando AndroidLoudnessEnhancer: $e\n$s');
+      final loudness = slot.loudnessEnhancer;
+      if (loudness != null) {
+        try {
+          await loudness.setEnabled(loudnessActive);
+          await loudness.setTargetGain(targetGain);
+        } on Exception catch (e, s) {
+          debugPrint('Error aplicando AndroidLoudnessEnhancer: $e\n$s');
+        }
       }
     }
   }
